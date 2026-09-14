@@ -19,9 +19,8 @@ diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/sh
        stdin: "ignore",
        detached: process.platform !== "win32",
      }),
-@@ -442,10 +444,15 @@
+@@ -441,9 +443,14 @@
      const shellEnv = Effect.fn("ShellTool.shellEnv")(function* (ctx: Tool.Context, cwd: string) {
--      const env = yield* Effect.promise((signal) => Direnv.environment(cwd, process.env, signal))
        const extra = yield* plugin.trigger(
          "shell.env",
 -        { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -34,9 +33,8 @@ diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/sh
 +        ...extra.env,
 +        OPENCODE_TOOL_OOM_SCORE_ADJ: process.env.OPENCODE_TOOL_OOM_SCORE_ADJ,
 +      }
-+      const env = yield* Effect.promise((signal) => Direnv.environment(cwd, process.env, signal))
        return {
-         ...env,
+         ...process.env,
          ...extra.env,
 diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 --- a/packages/plugin/src/index.ts
@@ -52,3 +50,16 @@ diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
    ) => Promise<void>
    "tool.execute.after"?: (
      input: { tool: string; sessionID: string; callID: string; args: any },
+diff --git a/packages/core/src/tool/bash.ts b/packages/core/src/tool/bash.ts
+--- a/packages/core/src/tool/bash.ts
++++ b/packages/core/src/tool/bash.ts
+@@ -152,6 +152,9 @@
+               if ((yield* fs.stat(target.canonical)).type !== "Directory")
+                 return yield* Effect.fail(new Error(`Working directory is not a directory: ${target.canonical}`))
+
++              if (process.env.HARBOR_CANIX_LLM_REQUIRE_LEGACY === "1")
++                return yield* Effect.fail(new Error("harbor-canix-llm requires legacy ShellTool; V2 Bash has no environment hook"))
++
+               const entries = yield* config.entries()
+               const shell =
+                 Object.assign({}, ...entries.flatMap((entry) => (entry.type === "document" ? [entry.info] : [])))

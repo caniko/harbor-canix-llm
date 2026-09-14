@@ -16,6 +16,11 @@
     lib.patchOpencode = package:
       package.overrideAttrs (old: {
         patches = (old.patches or []) ++ [./patches/opencode-shell-environment.patch];
+        postFixup =
+          (old.postFixup or "")
+          + ''
+            wrapProgram "$out/bin/opencode" --set HARBOR_CANIX_LLM_REQUIRE_LEGACY 1
+          '';
         passthru = (old.passthru or {}) // {harborCanixLlmEnvironmentVersion = 1;};
       });
     homeManagerModules.default = import ./nix/home.nix self;

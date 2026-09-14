@@ -77,9 +77,13 @@ package. The adapter also requires a runtime hook handshake before selection;
 the package marker alone is not execution evidence.
 
 The patch is targeted at Canix's `21105065b9e74d80f4f1c85b082e546ec9254791`
-OpenCode source. It introduces a versioned full-environment replacement result
-before direnv loading, but after normal command permission checks. In absence
-of a selection, existing direnv behavior remains unchanged. Review patch
+OpenCode source. That shipped revision does not have the local checkout's
+uncommitted direnv loader. The patch introduces full-environment replacement
+after normal command permission checks and preserves the shipped baseline when
+no environment is selected. It neither loads nor auto-approves .envrc. A future
+direnv integration must load only on the no-selection branch. The runtime wrapper
+sets `HARBOR_CANIX_LLM_REQUIRE_LEGACY=1`; V2 Bash explicitly fails after permission
+checking because that execution path has no replacement hook. Review patch
 applicability and permission ordering when updating the harness. Do not enable
 the adapter on unsupported runtimes or through a source that changes this order.
 
@@ -110,7 +114,7 @@ project-independent setup in language Harbor hooks, such as Harbor's Cargo cache
 
 ```sh
 node --test test/*.test.mjs
-node test/check-opencode.mjs /path/to/opencode
+node test/check-opencode.mjs /path/to/the-pinned-opencode-source
 ```
 
 The second command patches temporary copies and verifies permission ordering,
