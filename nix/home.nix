@@ -16,6 +16,23 @@ self: {
       cfg.projects;
   });
   runtime = "${cfg.package}/lib/harbor-canix-llm/src";
+  opencodeSettings = {
+    plugin = [
+      [
+        "${runtime}/opencode.mjs"
+        {
+          inherit registry;
+          nix = lib.getExe pkgs.nix;
+          node = lib.getExe pkgs.nodejs;
+          capture = "${runtime}/capture.mjs";
+        }
+      ]
+    ];
+    permission = {
+      harbor_devshell = "allow";
+      harbor_dev_shell_prepare = "ask";
+    };
+  };
 in {
   options.programs.harborCanixLlm = {
     enable = lib.mkEnableOption "Canix LLM harness orchestration";
@@ -34,6 +51,12 @@ in {
       });
     };
     opencode.enable = lib.mkEnableOption "OpenCode environment replacement adapter";
+    opencode.configFile = lib.mkOption {
+      type = lib.types.package;
+      readOnly = true;
+      default = pkgs.writeText "harbor-canix-llm-opencode.json" (builtins.toJSON opencodeSettings);
+      description = "Harbor-only configuration overlay for a scoped backend rollout through OPENCODE_CONFIG, without replacing unrelated harness settings.";
+    };
   };
   config = lib.mkIf cfg.enable {
     assertions = [
@@ -50,22 +73,6 @@ in {
         message = "Apply harbor-canix-llm.lib.patchOpencode to the actual OpenCode runtime and preserve its environment-version passthru on wrappers";
       }
     ];
-    programs.opencode.settings = lib.mkIf cfg.opencode.enable {
-      plugin = [
-        [
-          "${runtime}/opencode.mjs"
-          {
-            inherit registry;
-            nix = lib.getExe pkgs.nix;
-            node = lib.getExe pkgs.nodejs;
-            capture = "${runtime}/capture.mjs";
-          }
-        ]
-      ];
-      permission = {
-        harbor_devshell = "allow";
-        harbor_dev_shell_prepare = "ask";
-      };
-    };
+    programs.opencode.settings = lib.mkIf cfg.opencode.enable opencodeSettings;
   };
 }
