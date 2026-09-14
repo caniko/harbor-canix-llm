@@ -1,0 +1,121 @@
+# harbor-canix-llm
+
+Canix-specific harness orchestration, starting with session/project-scoped
+dev-shell switching in OpenCode. Language Harbors still own compilers and
+their dev shells. `harbor-meta` owns generic shell composition. This project
+owns personal harness policy and adapters; Canix supplies the approved projects.
+
+## Contract
+
+- No agent command is accepted or executed by the environment backend.
+- An operator-installed registry names canonical project directories and exact
+  dev-shell derivations. No `.envrc` evaluation or automatic approval occurs.
+- Selection requests `harbor_dev_shell_prepare` permission for the exact
+  `project:shell:/nix/store/...drv` identity, including cache hits. Preparation
+  can realize dependencies and executes the trusted shell hook. It is not a
+  read-only operation and does not activate NixOS or Home Manager.
+- Bash commands are unchanged and still pass through the harness permission
+  check before their child environment is resolved.
+- Selection is isolated by session and project. Concurrent commands capture
+  immutable selections. Conflicting switches fail instead of racing.
+- Captured environments live only in process memory, scoped to the session.
+  Clearing a selection restores normal harness/direnv behavior; deleting the
+  session releases its captures. Preparation failures retain the previous shell.
+- Only Linux and OpenCode's patched legacy `ShellTool` are supported. The V2
+  core Bash implementation currently has no plugin environment hook and is
+  unsupported. No fallback command runner is provided.
+
+This is **not a sandbox**. Approved build scripts, hooks, binaries on PATH,
+other plugins, and commands retain user authority. A trusted hook can read
+mutable project files or perform side effects. Startup injection variables are
+stripped from captured output, but this does not make an untrusted hook safe.
+Permissions must not auto-allow `harbor_dev_shell_prepare` for arbitrary sources.
+An agent with unrestricted writes to harness configuration could change policy;
+that is outside the command prompt policy's security boundary.
+
+## Approval and revisions
+
+The registry is rendered by Home Manager into the Nix store. It has no agent-side
+write or approve operation. Runtime approval is handled by OpenCode's ordinary
+permission UI. New derivations produce distinct permission identities.
+
+Editing a working tree does not silently update its registered shell. The
+operator must evaluate and install a new registry to consume updated dev-shell
+declarations/inputs. Code being compiled may remain dirty; the shell definition
+remains pinned. There is no implicit "trust all future shell revisions" mode.
+
+## Home Manager
+
+After publishing and locking this flake, import
+`inputs.harbor-canix-llm.homeManagerModules.default`. Minimal consumer:
+
+```nix
+{inputs, pkgs, ...}: {
+  imports = [inputs.harbor-canix-llm.homeManagerModules.default];
+  programs.opencode = {
+    enable = true;
+    package = inputs.harbor-canix-llm.lib.patchOpencode pkgs.opencode;
+  };
+  programs.harborCanixLlm = {
+    enable = true;
+    opencode.enable = true;
+    projects.modde = {
+      root = "/data/nvme0/can/canix/projects/repos/owned/rs-modde";
+      shells = {
+        default = inputs.modde.devShells.${pkgs.stdenv.hostPlatform.system}.default;
+        docs = inputs.modde.devShells.${pkgs.stdenv.hostPlatform.system}.docs;
+      };
+    };
+  };
+}
+```
+
+Patch the real OpenCode derivation, not a launcher wrapper. Canix's scoped
+launcher must carry `harborCanixLlmEnvironmentVersion = 1` in its passthru after
+wrapping that patched runtime. The Home Manager assertion rejects an unmarked
+package. The adapter also requires a runtime hook handshake before selection;
+the package marker alone is not execution evidence.
+
+The patch is targeted at Canix's `21105065b9e74d80f4f1c85b082e546ec9254791`
+OpenCode source. It introduces a versioned full-environment replacement result
+before direnv loading, but after normal command permission checks. In absence
+of a selection, existing direnv behavior remains unchanged. Review patch
+applicability and permission ordering when updating the harness. Do not enable
+the adapter on unsupported runtimes or through a source that changes this order.
+
+Restart OpenCode once after installing the module. Run an ordinary Bash call to
+verify the replacement hook (a direnv rejection can still establish the hook
+handshake). Then use `harbor_devshell` with `list`, `select`, `status`, or `clear`.
+Changing a selection needs no restart. Direct `nix develop -c`, `direnv exec`,
+and other command-wrapper permissions remain unchanged.
+
+Preparation uses a fixed `nix develop <approved-drv> --profile <private-runtime-profile> --command <store-node>
+<store-capture>` operation, with a timeout, output bound, and process-group
+cancellation. Hook output and captured values are never included in tool
+responses. Realized store paths are reused by Nix; captured environments are
+not reused across sessions. Private runtime profiles retain toolchain GC roots
+for the harness process lifetime; normal exit removes them, while a crash may
+leave them until reboot. These profiles contain Nix store references, not
+captured credentials. No cache publication or credential refresh is
+performed by this adapter. Canix operators may pre-realize approved shells
+through `canix cache build` under their normal private-cache policy.
+
+Hooks that depend on an interactive TTY, leave background services running, or
+export paths into Nix's disposable preparation directory are not supported.
+Temporary-directory variables are reset after capture; arbitrary references
+to transient files cannot be repaired automatically. Use persistent,
+project-independent setup in language Harbor hooks, such as Harbor's Cargo cache.
+
+## Checks
+
+```sh
+node --test test/*.test.mjs
+node test/check-opencode.mjs /path/to/opencode
+```
+
+The second command patches temporary copies and verifies permission ordering,
+full child environment replacement, and preservation of the harness OOM policy.
+It does not modify the OpenCode checkout. Flake checks expose
+the stdlib tests and the `harbor-meta` dev-shell check. Live OpenCode permission
+denial, two-shell switching, and Rust compilation still require deploying the
+patched runtime. Unit tests do not establish those live integration guarantees.

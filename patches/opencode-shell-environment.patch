@@ -1,0 +1,54 @@
+diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
+--- a/packages/opencode/src/tool/shell.ts
++++ b/packages/opencode/src/tool/shell.ts
+@@ -314,7 +314,8 @@
+       ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+         cwd,
+         env,
++        extendEnv: false,
+         stdin: "ignore",
+         detached: false,
+       }),
+       processClass,
+@@ -325,7 +326,8 @@
+     ChildProcess.make(toolOomCommand(shell, command, env), [], {
+       shell,
+       cwd,
+       env,
++      extendEnv: false,
+       stdin: "ignore",
+       detached: process.platform !== "win32",
+     }),
+@@ -442,10 +444,15 @@
+     const shellEnv = Effect.fn("ShellTool.shellEnv")(function* (ctx: Tool.Context, cwd: string) {
+-      const env = yield* Effect.promise((signal) => Direnv.environment(cwd, process.env, signal))
+       const extra = yield* plugin.trigger(
+         "shell.env",
+-        { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
+-        { env: {} },
++        { cwd, sessionID: ctx.sessionID, callID: ctx.callID, harborCanixLlm: 1 },
++        { env: {}, harborCanixLlmReplace: false },
+       )
++      // Permission checks precede shellEnv; replacement never wraps the command.
++      if (extra.harborCanixLlmReplace) return {
++        ...extra.env,
++        OPENCODE_TOOL_OOM_SCORE_ADJ: process.env.OPENCODE_TOOL_OOM_SCORE_ADJ,
++      }
++      const env = yield* Effect.promise((signal) => Direnv.environment(cwd, process.env, signal))
+       return {
+         ...env,
+         ...extra.env,
+diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
+--- a/packages/plugin/src/index.ts
++++ b/packages/plugin/src/index.ts
+@@ -268,8 +268,8 @@
+     output: { args: any },
+   ) => Promise<void>
+   "shell.env"?: (
+-    input: { cwd: string; sessionID?: string; callID?: string },
+-    output: { env: Record<string, string> },
++    input: { cwd: string; sessionID?: string; callID?: string; harborCanixLlm?: 1 },
++    output: { env: Record<string, string>; harborCanixLlmReplace?: boolean },
+   ) => Promise<void>
+   "tool.execute.after"?: (
+     input: { tool: string; sessionID: string; callID: string; args: any },
