@@ -5,16 +5,19 @@ self: {
   ...
 }: let
   cfg = config.programs.harborCanixLlm;
-  registry = pkgs.writeText "harbor-canix-llm-registry.json" (builtins.toJSON {
+  registryText = builtins.toJSON {
     version = 1;
     projects =
       lib.mapAttrsToList (name: project: {
         inherit name;
         inherit (project) root;
-        shells = lib.mapAttrs (_: shell: shell.drvPath) project.shells;
+        # Retain the derivation, not an eager dependency on all shell outputs.
+        shells = lib.mapAttrs (_: shell: builtins.unsafeDiscardOutputDependency shell.drvPath) project.shells;
       })
       cfg.projects;
-  });
+  };
+  registry = assert lib.all (context: !(context.allOutputs or false)) (builtins.attrValues (builtins.getContext registryText));
+    pkgs.writeText "harbor-canix-llm-registry.json" registryText;
   runtime = "${cfg.package}/lib/harbor-canix-llm/src";
   opencodeSettings = {
     plugin = [
