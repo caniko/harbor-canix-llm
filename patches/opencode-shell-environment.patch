@@ -47,11 +47,7 @@ diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/openco
 diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 --- a/packages/plugin/src/index.ts
 +++ b/packages/plugin/src/index.ts
-@@ -273,7 +273,8 @@
-       sessionID?: string
-       callID?: string
-       /** Inherited snapshot, never the mutable process environment. */
-       env?: Readonly<Record<string, string>>
+@@ -277,3 +277,4 @@
        signal?: AbortSignal
 +      harborCanixLlm?: 1
      },
