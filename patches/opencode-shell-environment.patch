@@ -11,52 +11,70 @@ diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/sh
        }),
        processClass,
 @@ -325,7 +326,8 @@
-     ChildProcess.make(toolOomCommand(shell, command, env), [], {
-       shell,
-       cwd,
-       env,
-+      extendEnv: false,
-       stdin: "ignore",
-       detached: process.platform !== "win32",
-     }),
-@@ -441,9 +443,14 @@
-     const shellEnv = Effect.fn("ShellTool.shellEnv")(function* (ctx: Tool.Context, cwd: string) {
-       const extra = yield* plugin.trigger(
-         "shell.env",
--        { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
--        { env: {} },
-+        { cwd, sessionID: ctx.sessionID, callID: ctx.callID, harborCanixLlm: 1 },
-+        { env: {}, harborCanixLlmReplace: false },
-       )
-+      // Permission checks precede shellEnv; replacement never wraps the command.
-+      if (extra.harborCanixLlmReplace) return {
-+        ...extra.env,
-+        OPENCODE_TOOL_OOM_SCORE_ADJ: process.env.OPENCODE_TOOL_OOM_SCORE_ADJ,
-+      }
-       return {
-         ...process.env,
-         ...extra.env,
+       ChildProcess.make(toolOomCommand(shell, command, env), [], {
+         shell,
+         cwd,
+         env,
++        extendEnv: false,
+         stdin: "ignore",
+         detached: process.platform !== "win32",
+       }),
+diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/opencode/src/plugin/shell-environment.ts
+--- a/packages/opencode/src/plugin/shell-environment.ts
++++ b/packages/opencode/src/plugin/shell-environment.ts
+@@ -9,8 +9,17 @@
+   const env = Object.fromEntries(
+     Object.entries(inherited).filter((entry): entry is [string, string] => entry[1] !== undefined),
+   )
+-  const output: { env: Record<string, string>; unset?: string[] } = { env: {} }
++  const output: { env: Record<string, string>; unset?: string[]; harborCanixLlmReplace?: boolean } = {
++    env: {},
++    harborCanixLlmReplace: false,
++  }
+   const extra = yield* plugin
+-    .trigger("shell.env", { ...input, env: Object.freeze({ ...env }) }, output)
++    .trigger("shell.env", { ...input, harborCanixLlm: 1, env: Object.freeze({ ...env }) }, output)
+     .pipe(Effect.catchCause((cause) => (input.signal?.aborted ? Effect.interrupt : Effect.failCause(cause))))
++  // Permission checks precede shellEnv; replacement never wraps the command.
++  if (extra.harborCanixLlmReplace)
++    return {
++      env: { ...extra.env, OPENCODE_TOOL_OOM_SCORE_ADJ: process.env.OPENCODE_TOOL_OOM_SCORE_ADJ },
++      resolved: true,
++    }
+   // Keep the overlay separate: a later plugin may deliberately restore an unset key.
+   for (const key of extra.unset ?? []) if (!Object.hasOwn(extra.env, key)) delete env[key]
+   return { env: { ...env, ...extra.env }, resolved: extra.unset !== undefined }
 diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 --- a/packages/plugin/src/index.ts
 +++ b/packages/plugin/src/index.ts
-@@ -268,8 +268,8 @@
+@@ -268,18 +268,20 @@
      output: { args: any },
    ) => Promise<void>
    "shell.env"?: (
--    input: { cwd: string; sessionID?: string; callID?: string },
--    output: { env: Record<string, string> },
-+    input: { cwd: string; sessionID?: string; callID?: string; harborCanixLlm?: 1 },
-+    output: { env: Record<string, string>; harborCanixLlmReplace?: boolean },
+     input: {
+       cwd: string
+       sessionID?: string
+       callID?: string
+       /** Inherited snapshot, never the mutable process environment. */
+       env?: Readonly<Record<string, string>>
+       signal?: AbortSignal
++      harborCanixLlm?: 1
+     },
+     output: {
+       env: Record<string, string>
+       /** Opt into per-operation lookup. Removals precede env assignments, so later overlays win. */
+       unset?: string[]
++      harborCanixLlmReplace?: boolean
+     },
    ) => Promise<void>
    "tool.execute.after"?: (
-     input: { tool: string; sessionID: string; callID: string; args: any },
 diff --git a/packages/core/src/tool/bash.ts b/packages/core/src/tool/bash.ts
---- a/packages/core/src/tool/bash.ts
-+++ b/packages/core/src/tool/bash.ts
+--- a/packages/core/src/file/bash.ts
++++ b/packages/core/src/file/bash.ts
 @@ -152,6 +152,9 @@
                if ((yield* fs.stat(target.canonical)).type !== "Directory")
                  return yield* Effect.fail(new Error(`Working directory is not a directory: ${target.canonical}`))
-
+ 
 +              if (process.env.HARBOR_CANIX_LLM_REQUIRE_LEGACY === "1")
 +                return yield* Effect.fail(new Error("harbor-canix-llm requires legacy ShellTool; V2 Bash has no environment hook"))
 +
