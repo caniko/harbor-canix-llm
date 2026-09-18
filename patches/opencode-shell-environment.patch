@@ -47,7 +47,8 @@ diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/openco
 diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 --- a/packages/plugin/src/index.ts
 +++ b/packages/plugin/src/index.ts
-@@ -268,18 +268,20 @@
+@@ -267,21 +267,23 @@
+     input: { tool: string; sessionID: string; callID: string },
      output: { args: any },
    ) => Promise<void>
    "shell.env"?: (
@@ -68,6 +69,8 @@ diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
      },
    ) => Promise<void>
    "tool.execute.after"?: (
+     input: { tool: string; sessionID: string; callID: string; args: any },
+     output: {
 diff --git a/packages/core/src/tool/bash.ts b/packages/core/src/tool/bash.ts
 --- a/packages/core/src/tool/bash.ts
 +++ b/packages/core/src/tool/bash.ts
