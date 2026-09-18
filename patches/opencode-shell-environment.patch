@@ -11,14 +11,14 @@ diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/sh
        }),
        processClass,
 @@ -325,7 +326,8 @@
-       ChildProcess.make(toolOomCommand(shell, command, env), [], {
-         shell,
-         cwd,
-         env,
-+        extendEnv: false,
-         stdin: "ignore",
-         detached: process.platform !== "win32",
-       }),
+     ChildProcess.make(toolOomCommand(shell, command, env), [], {
+       shell,
+       cwd,
+       env,
++      extendEnv: false,
+       stdin: "ignore",
+       detached: process.platform !== "win32",
+     }),
 diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/opencode/src/plugin/shell-environment.ts
 --- a/packages/opencode/src/plugin/shell-environment.ts
 +++ b/packages/opencode/src/plugin/shell-environment.ts
@@ -69,12 +69,12 @@ diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
    ) => Promise<void>
    "tool.execute.after"?: (
 diff --git a/packages/core/src/tool/bash.ts b/packages/core/src/tool/bash.ts
---- a/packages/core/src/file/bash.ts
-+++ b/packages/core/src/file/bash.ts
+--- a/packages/core/src/tool/bash.ts
++++ b/packages/core/src/tool/bash.ts
 @@ -152,6 +152,9 @@
                if ((yield* fs.stat(target.canonical)).type !== "Directory")
                  return yield* Effect.fail(new Error(`Working directory is not a directory: ${target.canonical}`))
- 
+
 +              if (process.env.HARBOR_CANIX_LLM_REQUIRE_LEGACY === "1")
 +                return yield* Effect.fail(new Error("harbor-canix-llm requires legacy ShellTool; V2 Bash has no environment hook"))
 +
