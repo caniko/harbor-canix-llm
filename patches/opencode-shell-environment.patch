@@ -47,13 +47,7 @@ diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/openco
 diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 --- a/packages/plugin/src/index.ts
 +++ b/packages/plugin/src/index.ts
-@@ -267,21 +267,23 @@
-     input: { tool: string; sessionID: string; callID: string },
-     output: { args: any },
-   ) => Promise<void>
-   "shell.env"?: (
-     input: {
-       cwd: string
+@@ -273,7 +273,8 @@
        sessionID?: string
        callID?: string
        /** Inherited snapshot, never the mutable process environment. */
@@ -62,15 +56,13 @@ diff --git a/packages/plugin/src/index.ts b/packages/plugin/src/index.ts
 +      harborCanixLlm?: 1
      },
      output: {
+@@ -280,5 +280,6 @@
        env: Record<string, string>
        /** Opt into per-operation lookup. Removals precede env assignments, so later overlays win. */
        unset?: string[]
 +      harborCanixLlmReplace?: boolean
      },
    ) => Promise<void>
-   "tool.execute.after"?: (
-     input: { tool: string; sessionID: string; callID: string; args: any },
-     output: {
 diff --git a/packages/core/src/tool/bash.ts b/packages/core/src/tool/bash.ts
 --- a/packages/core/src/tool/bash.ts
 +++ b/packages/core/src/tool/bash.ts
