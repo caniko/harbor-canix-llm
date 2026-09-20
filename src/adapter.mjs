@@ -6,6 +6,13 @@ import path from "node:path";
 export function createAdapter(registry, prepareEnvironment) {
   const environments = createEnvironments(registry, prepareEnvironment);
   const compatible = new Set();
+  // Shared selection lookup for environment hooks. Returns the captured
+  // environment or undefined when the session selected nothing covering cwd.
+  // Sessionless entry points never inherit a selection.
+  async function resolve(input) {
+    if (!input.sessionID) return undefined;
+    return environments.environment(input.sessionID, input.cwd);
+  }
   return {
     async execute(args, context) {
       if (!context.sessionID) throw new Error("Session identity is required");
@@ -50,10 +57,19 @@ export function createAdapter(registry, prepareEnvironment) {
         throw new Error("OpenCode lacks the harbor-canix-llm replacement contract; refusing environment injection");
       }
       compatible.add(input.sessionID);
-      const env = await environments.environment(input.sessionID, input.cwd);
+      const env = await resolve(input);
       if (!env) return;
       output.env = env;
       output.harborCanixLlmReplace = true;
+    },
+    async lspEnvironment(input, output) {
+      // Explicit language-server contract: only this hook affects LSP
+      // processes. The hook name itself proves runtime support, so no vendor
+      // marker is needed; an unpatched runtime never triggers it.
+      const env = await resolve(input);
+      if (!env) return;
+      output.env = env;
+      output.replace = true;
     },
     release: (session) => {
       compatible.delete(session);

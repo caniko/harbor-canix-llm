@@ -25,6 +25,7 @@ export const HarborCanixLlm = async (_context, options) => {
       }),
     },
     "shell.env": adapter.shellEnvironment,
+    "lsp.env": adapter.lspEnvironment,
     event: async ({ event }) => {
       if (event.type === "session.deleted") adapter.release(event.properties.info.id);
     },
