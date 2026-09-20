@@ -15,7 +15,7 @@ export const HarborCanixLlm = async (_context, options) => {
   return {
     tool: {
       harbor_devshell: tool({
-        description: "List/select/status/clear an approved immutable project dev shell. Selection separately requests permission to realize it and execute its trusted hook. Never executes an agent command. Bash commands retain normal permission checks. Run one ordinary Bash call first to verify the replacement hook.",
+        description: "List/select/status/clear an approved immutable project dev shell. Selection separately requests permission to realize it and execute its trusted hook. Only one selection may cover a working directory: selecting a project whose root contains (or sits inside) another selected project fails closed, so clear the overlapping selection first. Never executes an agent command. Bash commands retain normal permission checks. Run one ordinary Bash call first to verify the replacement hook.",
         args: {
           action: tool.schema.enum(["list", "select", "status", "clear"]),
           project: tool.schema.string().optional(),

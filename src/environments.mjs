@@ -218,7 +218,7 @@ export function createEnvironments(registry, prepareEnvironment) {
       const candidates = config.projects.map((project) => selections.get(keyFor(session, project.name))).filter(Boolean);
       const directory = await realpath(cwd);
       const matches = candidates.filter((entry) => directory === entry.root || directory.startsWith(entry.root + path.sep));
-      if (matches.length > 1) throw new Error("Ambiguous overlapping project environments");
+      if (matches.length > 1) throw new Error("Ambiguous overlapping project environments; clear all but one selection");
       if (!matches.length) return undefined;
       if ((await projectAt(matches[0].project, cwd)).identity !== matches[0].identity) {
         throw new Error("Selected project root changed; clear and reselect explicitly");

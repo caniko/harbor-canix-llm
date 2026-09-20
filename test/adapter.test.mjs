@@ -72,6 +72,46 @@ test("lsp.env outside the project root resolves nothing", async (t) => {
   assert.deepEqual(output, { env: {} });
 });
 
+test("overlapping parent/child selections fail closed, never merged", async (t) => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "harbor-nest-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const child = path.join(root, "projects", "repos", "owned", "modde-rs");
+  await mkdir(child, { recursive: true });
+  const registry = {
+    version: 1,
+    projects: [
+      { name: "canix", root, shells: { native: a } },
+      { name: "modde-rs", root: child, shells: { native: a } },
+    ],
+  };
+  let preparations = 0;
+  const adapter = createAdapter(registry, async () => ({ PATH: `/capture-${++preparations}` }));
+  const ctx = { directory: root, worktree: root };
+  const verify = async (session) =>
+    adapter.shellEnvironment({ cwd: root, sessionID: session, harborCanixLlm: 1 }, { env: {} });
+  const pick = async (session, project) => {
+    await verify(session);
+    return adapter.execute(
+      { action: "select", project, shell: "native" },
+      { sessionID: session, ...ctx, abort: undefined, ask: async () => {} },
+    );
+  };
+  await pick("one", "canix");
+  await pick("one", "modde-rs");
+  // Both selections contain the child cwd: resolution must refuse, and the
+  // shell hook must refuse the same way.
+  await assert.rejects(adapter.lspEnvironment({ cwd: child, sessionID: "one" }, { env: {} }), /clear all but one/);
+  await assert.rejects(
+    adapter.shellEnvironment({ cwd: child, sessionID: "one", harborCanixLlm: 1 }, { env: {} }),
+    /clear all but one/,
+  );
+  // Clearing the parent restores the child selection.
+  await adapter.execute({ action: "clear", project: "canix" }, { sessionID: "one" });
+  const output = { env: {} };
+  await adapter.lspEnvironment({ cwd: child, sessionID: "one" }, output);
+  assert.equal(output.replace, true);
+});
+
 test("shell.env behavior is unchanged by the shared lookup", async (t) => {
   const { root, adapter, select } = await fixture(t);
   const output = { env: {} };
