@@ -4,22 +4,29 @@
 // environment resolution; the resolved environment is used exactly — a
 // resolution failure never falls back and never spawns a server.
 //
+// One serialized operation runs per session/root at a time, from environment
+// resolution through the final response: a reselection can never retire a
+// server out from under an in-flight request, and every spawned child is
+// either stored or stopped before its operation ends.
+//
 // Document positions are 1-based lines and 1-based UTF-16 columns, converted
 // to the 0-based LSP encoding at the boundary. Diagnostics are explicit
 // results: an empty diagnostic set, a timeout, and an unsupported server are
 // three different answers, never conflated.
 import { spawn } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { StreamMessageReader, StreamMessageWriter, createMessageConnection } from "vscode-jsonrpc/node.js";
 
+function escapes(parent, target) {
+  const relative = path.relative(parent, target);
+  return relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+}
+
 async function canonicalUnder(root, file) {
-  const [realRoot, realFile] = await Promise.all([realpath(root), realpath(file).catch(() => path.resolve(file))]);
-  const relative = path.relative(realRoot, realFile);
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`pkl file escapes the project root: ${file}`);
-  }
+  const [realRoot, realFile] = await Promise.all([realpath(root), realpath(file)]);
+  if (escapes(realRoot, realFile)) throw new Error(`pkl file escapes the project root: ${file}`);
   return { root: realRoot, file: realFile, uri: pathToFileURL(realFile).href };
 }
 
@@ -44,43 +51,55 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     return !entry.stopped && !entry.dead && entry.child.exitCode === null && entry.child.signalCode === null;
   }
 
+  async function exited(child) {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
+
+  // Bounded wait that always clears its timer.
+  async function deadline(ms, promise) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("pkl operation timed out")), ms);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function stop(entry) {
     if (entry.stopped) return;
     entry.stopped = true;
-    try {
-      await Promise.race([
-        (async () => {
-          try {
-            await entry.connection.sendRequest("shutdown", undefined);
-          } catch {}
-          try {
-            entry.connection.sendNotification("exit");
-          } catch {}
-        })(),
-        new Promise((resolve) => setTimeout(resolve, stopGraceMs)),
-      ]);
-    } finally {
-      entry.connection.dispose();
-    }
-    try {
-      entry.connection.sendNotification("exit");
-    } catch {}
-    const exited = await Promise.race([
-      (async () => {
-        if (entry.child.exitCode !== null || entry.child.signalCode !== null) return true;
-        await new Promise((resolve) => entry.child.once("exit", resolve));
-        return true;
-      })(),
-      new Promise((resolve) => setTimeout(() => resolve(false), stopGraceMs)),
-    ]);
-    if (!exited) entry.child.kill("SIGKILL");
+    await deadline(stopGraceMs, (async () => {
+      try {
+        await entry.connection.sendRequest("shutdown", undefined);
+      } catch {}
+      try {
+        entry.connection.sendNotification("exit");
+      } catch {}
+    })()).catch(() => {});
+    entry.connection.dispose();
+    await deadline(stopGraceMs, exited(entry.child)).catch(() => {});
+    if (entry.child.exitCode === null && entry.child.signalCode === null) entry.child.kill("SIGKILL");
+    await exited(entry.child);
   }
 
-  async function start(sessionID, root, env) {
+  async function start(root, env) {
     const child = spawn(executable, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
     const entry = {
       child, connection: null, env, documents: new Map(),
       stopped: false, dead: false, pid: child.pid, stderrText: "",
+    };
+    const fail = (cause) => {
+      entry.stopped = true;
+      try { child.kill("SIGKILL"); } catch {}
+      try { entry.connection?.dispose(); } catch {}
+      throw cause;
     };
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
       entry.stderrText = (entry.stderrText + chunk).slice(-4096);
@@ -92,80 +111,64 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     entry.connection = connection;
     connection.onRequest("workspace/configuration", () => []);
     connection.onRequest("window/workDoneProgress/create", () => null);
-    connection.onNotification("textDocument/publishDiagnostics", (params) => {
-      entry.lastPublished.set(params.uri, params.diagnostics ?? []);
-      const waiter = entry.openWaiters?.get(params.uri);
-      if (waiter) {
-        entry.openWaiters.delete(params.uri);
-        waiter();
-      }
-    });
-    entry.lastPublished = new Map();
-    entry.openWaiters = new Map();
     child.on("error", () => {});
-    child.on("exit", (code, signal) => {
+    child.on("exit", () => {
       entry.dead = true;
-      connection.dispose();
+      try { connection.dispose(); } catch {}
     });
     connection.listen();
     try {
       await new Promise((resolve, reject) => {
-        child.on("error", reject);
         if (child.exitCode !== null || child.signalCode !== null) {
           reject(new Error(`pkl-lsp exited immediately: ${entry.stderrText.slice(-500)}`));
         } else {
+          child.once("error", reject);
           child.once("spawn", resolve);
         }
       });
-      const capabilities = await connection.sendRequest("initialize", {
-        processId: process.pid,
-        rootUri: pathToFileURL(root).href,
-        capabilities: { textDocument: { hover: { contentFormat: ["markdown", "plaintext"] }, publishDiagnostics: { relatedInformation: true } } },
-      });
+      const capabilities = await withTimeout(
+        connection.sendRequest("initialize", {
+          processId: process.pid,
+          rootUri: pathToFileURL(root).href,
+          capabilities: { textDocument: { hover: { contentFormat: ["markdown", "plaintext"] }, publishDiagnostics: { relatedInformation: true } } },
+        }),
+        "initialize",
+        timeoutMs,
+      );
       connection.sendNotification("initialized", {});
       entry.hoverProvider = capabilities?.capabilities?.hoverProvider ?? capabilities?.hoverProvider;
       return entry;
     } catch (error) {
-      entry.stopped = true;
-      try { child.kill("SIGKILL"); } catch {}
-      connection.dispose();
-      throw error;
+      fail(error);
     }
   }
 
-  // Exactly one lifecycle transition runs per identity at a time; every
-  // spawned child is either stored or stopped before the transition ends.
-  function chain(id, transition) {
+  // Exactly one complete operation runs per identity at a time.
+  function operate(id, operation) {
     const previous = chains.get(id) ?? Promise.resolve();
-    const next = previous.then(transition, transition);
+    const next = previous.then(operation, operation);
     chains.set(id, next);
-    next.then(
-      () => { if (chains.get(id) === next) chains.delete(id); },
-      () => { if (chains.get(id) === next) chains.delete(id); },
-    );
+    const cleanup = () => { if (chains.get(id) === next) chains.delete(id); };
+    next.then(cleanup, cleanup);
     return next;
   }
 
-  async function serverFor(sessionID, root, env, generation) {
+  async function serverFor(id, sessionID, root, env, generation) {
     if (disposed) throw new Error("pkl servers are disposed");
-    const id = key(sessionID, root);
-    return chain(id, async () => {
-      if (disposed) throw new Error("pkl servers are disposed");
-      const current = servers.get(id);
-      if (current && alive(current) && current.generation === generation) return current;
-      if (current) {
-        servers.delete(id);
-        await stop(current).catch(() => {});
-      }
-      const entry = await start(sessionID, root, env);
-      entry.generation = generation;
-      if (disposed) {
-        await stop(entry).catch(() => {});
-        throw new Error("pkl servers are disposed");
-      }
-      servers.set(id, entry);
-      return entry;
-    });
+    const current = servers.get(id);
+    if (current && alive(current) && current.generation === generation) return current;
+    if (current) {
+      servers.delete(id);
+      await stop(current).catch(() => {});
+    }
+    const entry = await start(root, env);
+    entry.generation = generation;
+    if (disposed) {
+      await stop(entry).catch(() => {});
+      throw new Error("pkl servers are disposed");
+    }
+    servers.set(id, entry);
+    return entry;
   }
 
   async function open(entry, uri, file) {
@@ -173,13 +176,6 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     const text = await readFile(file, "utf8");
     if (known && known.text === text) return known;
     const version = (known?.version ?? 0) + 1;
-    // The server applies document notifications asynchronously; a request
-    // sent before it observes the open can fail. Wait for the publish
-    // round-trip (bounded: some files produce no push).
-    const observed = new Promise((resolve) => {
-      entry.openWaiters.set(uri, resolve);
-      setTimeout(resolve, 5_000).unref?.();
-    });
     if (!known) {
       entry.connection.sendNotification("textDocument/didOpen", {
         textDocument: { uri, languageId: "pkl", version, text },
@@ -190,7 +186,6 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
         contentChanges: [{ text }],
       });
     }
-    await observed;
     const record = { version, text };
     entry.documents.set(uri, record);
     return record;
@@ -203,6 +198,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
       ? connection.sendRequest(method, params)
       : connection.sendRequest(method, params, token);
   }
+
   function tokenFor(signal) {
     if (!signal) return undefined;
     if (signal.aborted) throw abortError();
@@ -215,74 +211,103 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     };
   }
 
-  function withTimeout(promise, method, timeout) {
+  function withTimeout(promise, method, timeout, signal) {
     let timer;
+    let onAbort;
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error(`pkl-lsp request ${method} timed out`)), timeout);
       timer.unref?.();
+      if (signal) {
+        onAbort = () => reject(abortError());
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
-    return Promise.race([promiseFinally(promise, () => clearTimeout(timer)), deadline]);
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    };
+    return Promise.race([
+      promise.then(
+        (value) => { cleanup(); return value; },
+        (error) => { cleanup(); throw error; },
+      ),
+      deadline.then(
+        (value) => { cleanup(); return value; },
+        (error) => { cleanup(); throw error; },
+      ),
+    ]);
   }
 
-  function promiseFinally(promise, callback) {
-    return promise.then(
-      (value) => { callback(); return value; },
-      (error) => { callback(); throw error; },
-    );
-  }
-
-  async function withServer(sessionID, root, file, resolveEnvironment, signal) {
+  async function operateOn(sessionID, root, file, resolveEnvironment, signal, action) {
     const { root: realRoot, file: realFile, uri } = await canonicalUnder(root, file);
-    await stat(realFile);
-    const resolved = await resolveEnvironment({ sessionID, root: realRoot, signal });
-    if (!resolved || typeof resolved.env !== "object" || typeof resolved.generation !== "string") {
-      throw new Error("pkl environment resolution must return { env, generation }");
-    }
-    const env = {};
-    for (const [name, value] of Object.entries(resolved.env)) {
-      if (typeof value === "string") env[name] = value;
-    }
-    const entry = await serverFor(sessionID, realRoot, env, resolved.generation);
-    await open(entry, uri, realFile);
-    return { entry, uri };
+    const id = key(sessionID, realRoot);
+    return operate(id, async () => {
+      if (signal?.aborted) throw abortError();
+      const resolved = await resolveEnvironment({ sessionID, root: realRoot, signal });
+      if (!resolved || typeof resolved.env !== "object" || typeof resolved.generation !== "string") {
+        throw new Error("pkl environment resolution must return { env, generation }");
+      }
+      const env = {};
+      for (const [name, value] of Object.entries(resolved.env)) {
+        if (typeof value === "string") env[name] = value;
+      }
+      const attempt = async (retried) => {
+        const entry = await serverFor(id, sessionID, realRoot, env, resolved.generation);
+        await open(entry, uri, realFile);
+        try {
+          return await action(entry, uri);
+        } catch (error) {
+          // The server can die between the liveness check and the request
+          // (external crash); replace it and retry exactly once.
+          if (retried || alive(entry) || !/disposed|is not running|exited/i.test(String(error?.message))) throw error;
+          servers.delete(id);
+          return attempt(true);
+        }
+      };
+      return attempt(false);
+    });
   }
 
   return {
     async hover({ sessionID, root, file, line, character, resolveEnvironment, signal, timeout = timeoutMs }) {
       const token = tokenFor(signal);
-      const { entry, uri } = await withServer(sessionID, root, file, resolveEnvironment, signal);
-      if (!entry.hoverProvider) return { state: "unsupported" };
-      const contents = await withTimeout(
-        sendRequest(entry.connection, "textDocument/hover", {
-          textDocument: { uri },
-          position: { line: line - 1, character: character - 1 },
-        }, token),
-        "textDocument/hover",
-        timeout ?? timeoutMs,
-      );
-      return { state: "ok", hover: contents ?? null, pid: entry.pid, generation: entry.generation };
+      return operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri) => {
+        if (!entry.hoverProvider) return { state: "unsupported" };
+        const contents = await withTimeout(
+          sendRequest(entry.connection, "textDocument/hover", {
+            textDocument: { uri },
+            position: { line: line - 1, character: character - 1 },
+          }, token),
+          "textDocument/hover",
+          timeout ?? timeoutMs,
+          signal,
+        );
+        return { state: "ok", hover: contents ?? null, pid: entry.pid, generation: entry.generation };
+      });
     },
 
     async diagnostics({ sessionID, root, file, resolveEnvironment, signal, timeout = timeoutMs }) {
       const token = tokenFor(signal);
-      const { entry, uri } = await withServer(sessionID, root, file, resolveEnvironment, signal);
-      let result;
-      try {
-        result = await withTimeout(
-          sendRequest(entry.connection, "textDocument/diagnostic", { textDocument: { uri } }, token),
-          "textDocument/diagnostic",
-          timeout ?? timeoutMs,
-        );
-      } catch (error) {
-        if (error?.code === "cancelled") throw error;
-        if (/timed out/.test(error.message)) return { state: "timeout" };
-        if (/Method not found/i.test(String(error?.message))) return { state: "unsupported" };
-        throw error;
-      }
-      if (!result || typeof result !== "object" || result.kind !== "full" || !Array.isArray(result.items)) {
-        throw new Error(`pkl-lsp returned a malformed diagnostic report`);
-      }
-      return { state: "ok", diagnostics: result.items, pid: entry.pid, generation: entry.generation };
+      return operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri) => {
+        let result;
+        try {
+          result = await withTimeout(
+            sendRequest(entry.connection, "textDocument/diagnostic", { textDocument: { uri } }, token),
+            "textDocument/diagnostic",
+            timeout ?? timeoutMs,
+            signal,
+          );
+        } catch (error) {
+          if (error?.code === "cancelled") throw error;
+          if (/timed out/.test(error.message)) return { state: "timeout" };
+          if (/Method not found/i.test(String(error?.message))) return { state: "unsupported" };
+          throw error;
+        }
+        if (!result || typeof result !== "object" || result.kind !== "full" || !Array.isArray(result.items)) {
+          throw new Error(`pkl-lsp returned a malformed diagnostic report`);
+        }
+        return { state: "ok", diagnostics: result.items, pid: entry.pid, generation: entry.generation };
+      });
     },
 
     async status({ sessionID, root }) {
@@ -294,8 +319,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
 
     async dispose() {
       disposed = true;
-      const ids = [...chains.values()];
-      await Promise.all(ids.map((pending) => pending.catch(() => {})));
+      await Promise.all([...chains.values()].map((pending) => pending.catch(() => {})));
       const entries = [...servers.values()];
       servers.clear();
       await Promise.all(entries.map((entry) => stop(entry).catch(() => {})));

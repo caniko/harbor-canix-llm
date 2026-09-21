@@ -28,12 +28,12 @@ function baselineEnvironment() {
 }
 
 async function matchRoot(roots, file) {
-  const realFile = await realpath(file).catch(() => path.resolve(file));
+  const realFile = await realpath(file);
   let best = null;
   for (const root of roots) {
     const realRoot = await realpath(root);
     const relative = path.relative(realRoot, realFile);
-    if (relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+    if (relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
       if (!best || realRoot.length > best.length) best = realRoot;
     }
   }
@@ -62,9 +62,14 @@ const positionSchema = {
 export async function setupPkl(ctx, overrides = {}) {
   const options = { ...ctx.options, ...overrides };
   const { executable, args = [], timeoutMs, resolveEnvironment, roots = [] } = options;
-  if (!executable) throw new Error("canix.pkl requires an absolute pkl-lsp executable path");
-  if (!Array.isArray(roots) || roots.length === 0 || roots.some((root) => typeof root !== "string")) {
-    throw new Error("canix.pkl requires a non-empty roots array of project directories");
+  if (typeof executable !== "string" || !path.isAbsolute(executable)) {
+    throw new Error("canix.pkl requires an absolute pkl-lsp executable path");
+  }
+  if (!Array.isArray(roots) || roots.length === 0 || roots.some((root) => typeof root !== "string" || !path.isAbsolute(root))) {
+    throw new Error("canix.pkl requires a non-empty roots array of absolute project directories");
+  }
+  if (new Set(roots.map((root) => path.normalize(root))).size !== roots.length) {
+    throw new Error("canix.pkl requires distinct roots");
   }
   const servers = createPklServers({ executable, args, timeoutMs });
   const resolve = resolveEnvironment ?? (async () => baselineEnvironment());

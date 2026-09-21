@@ -76,6 +76,21 @@ gate("registers hover, diagnostics and status tools", async () => {
   assert.equal(JSON.parse(status.content).running, false);
 });
 
+gate("dotdot-prefixed names inside the root are allowed", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pkl-plugin-"));
+  await writeFile(path.join(dir, "..notes.pkl"), 'name = "world"\n');
+  const { tool, dispose } = await setup(dir);
+  try {
+    const hover = await tool.added.get("pkl_hover").execute(
+      { file: path.join(dir, "..notes.pkl"), line: 1, character: 2 },
+      { sessionID: "s1" },
+    );
+    assert.match(hover.content, /name/);
+  } finally {
+    await dispose();
+  }
+});
+
 gate("rejects files outside the configured roots", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pkl-plugin-"));
   const outside = await mkdtemp(path.join(tmpdir(), "pkl-outside-"));
