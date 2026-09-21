@@ -10,9 +10,11 @@
 // realization stays a separately-authorized runtime step, never executed here).
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const [bin, pluginMjs, registry, nix, nodeBin, capture, pklLsp] = process.argv.slice(2);
 if (!bin || !pluginMjs || !registry || !nix || !nodeBin || !capture || !pklLsp) {
@@ -25,8 +27,17 @@ const { createAdapter } = await import("../src/adapter.mjs");
 const { HarborCanixLlm } = await import("../src/opencode.mjs");
 
 const drv = (tag) => `/nix/store/00000000000000000000000000000000-${tag}.drv`;
+const scratch = [];
 const home = await realpath(await mkdtemp(path.join(tmpdir(), "harbor-gate-home-")));
 const proj = await realpath(await mkdtemp(path.join(tmpdir(), "harbor-gate-proj-")));
+scratch.push(home, proj);
+process.on("exit", () => {
+  for (const dir of scratch) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
 const strictEnv = {
   PATH: "/usr/bin:/bin",
   HOME: home,
@@ -36,19 +47,45 @@ const strictEnv = {
   OPENCODE_DISABLE_LSP_DOWNLOAD: "1",
 };
 
+const srcDir = path.dirname(path.dirname(fileURLToPath(import.meta.url))) + "/src";
+
 async function run(command, args, options = {}) {
-  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+  const { timeoutMs = 120_000, ...spawnOptions } = options;
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOptions });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
   child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
-  const code = await new Promise((resolve) => child.on("close", resolve));
+  const code = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`${command} ${args[0]} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.on("error", (cause) => {
+      clearTimeout(timer);
+      reject(new Error(`cannot spawn ${command}: ${cause.message}`));
+    });
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve(status);
+    });
+  });
   return { code, stdout, stderr };
 }
 
-async function serveWith(config, port, body) {
+async function freePort() {
+  const { createServer } = await import("node:net");
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function serveWith(config, body) {
   await mkdir(path.join(home, "config", "opencode"), { recursive: true });
   await writeFile(path.join(home, "config", "opencode", "opencode.json"), JSON.stringify(config));
+  const port = await freePort();
   const server = spawn(bin, ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
     stdio: ["ignore", "pipe", "pipe"],
     env: strictEnv,
@@ -69,13 +106,32 @@ async function serveWith(config, port, body) {
     return await body(port);
   } finally {
     server.kill("SIGKILL");
+    await new Promise((resolve) => server.on("close", resolve));
   }
 }
 
 const pluginOptions = { registry, nix, node: nodeBin, capture };
 const pluginEntry = [pluginMjs, pluginOptions];
+const packagedSrcDir = path.dirname(pluginMjs);
 
-// --- Part 1: packaged binary loads the real adapter with the real registry.
+// The lifecycle half imports the local sources while the binary half loads
+// the packaged plugin: refuse to run when they differ, so a stale package
+// can never stand in for the adapter under test.
+for (const file of ["adapter.mjs", "opencode.mjs", "environments.mjs"]) {
+  const [local, packaged] = await Promise.all([
+    readFile(path.join(srcDir, file), "utf8"),
+    readFile(path.join(packagedSrcDir, file), "utf8"),
+  ]);
+  assert.equal(packaged, local, `${file} differs between packaged plugin and adapter under test`);
+}
+console.log("consistency: packaged adapter matches adapter under test");
+
+// --- Part 1: packaged binary boots with the real adapter configured.
+// NOTE: instance boot and plugin init are lazy, so session creation proves
+// the boot path stays intact with the plugin configured, not that hooks
+// fired. Session-scoped hook behavior is proven by the fork-side selection
+// test; here the sessionless diagnostic proves the LSP path is unaffected
+// by the adapter's presence.
 {
   const config = {
     lsp: { pkl: { command: [pklLsp, "--stdio"], extensions: [".pkl"] } },
@@ -88,13 +144,13 @@ const pluginEntry = [pluginMjs, pluginOptions];
   const probe = await run(bin, ["debug", "config"], { env: strictEnv, cwd: proj });
   assert.equal(probe.code, 0, `debug config failed: ${probe.stderr.slice(0, 300)}`);
   assert.ok(probe.stdout.includes(pluginMjs), "effective config must carry the real adapter plugin");
-  await serveWith(config, 14501, async (port) => {
+  await serveWith(config, async (port) => {
     const created = await fetch(`http://127.0.0.1:${port}/session`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ directory: proj }),
     });
-    assert.equal(created.status, 200, "session create must load the real adapter plugin");
+    assert.equal(created.status, 200, "session create must succeed with the real adapter configured");
     const session = await created.json();
     assert.match(session.id, /^ses_/);
     const diag = await run(bin, ["debug", "lsp", "diagnostics", path.join(proj, "bad.pkl")], {
@@ -104,10 +160,10 @@ const pluginEntry = [pluginMjs, pluginOptions];
     assert.equal(diag.code, 0, `diagnostics failed: ${diag.stderr.slice(0, 300)}`);
     const parsed = JSON.parse(diag.stdout);
     const entries = Object.values(parsed).flat();
-    assert.ok(entries.length > 0, "expected a real Pkl diagnostic with the adapter loaded");
+    assert.ok(entries.length > 0, "expected a real Pkl diagnostic with the adapter configured");
     assert.ok(entries.every((entry) => entry.source === "pkl-lsp"));
   });
-  console.log("binary wiring: plugin loads, session boots, sessionless diagnostics served");
+  console.log("binary wiring: boot path intact, sessionless diagnostics served");
 }
 
 // --- Part 2: fail-closed adapter boundary through the real entrypoint.
@@ -123,6 +179,8 @@ const pluginEntry = [pluginMjs, pluginOptions];
 // --- Part 3: selection lifecycle over the real adapter (stubbed preparation seam).
 {
   const gate = await realpath(await mkdtemp(path.join(tmpdir(), "harbor-gate-select-")));
+  scratch.push(gate);
+  try {
   const nested = path.join(gate, "nested");
   await mkdir(nested, { recursive: true });
   const registryObject = {
@@ -188,6 +246,9 @@ const pluginEntry = [pluginMjs, pluginOptions];
   adapter.release("b");
   await assert.rejects(lspOutput("b"), /released/);
   console.log("lifecycle: select/reselect/clear/isolate/deny/release verified");
+  } finally {
+    await rm(gate, { recursive: true, force: true });
+  }
 }
 
 // --- Part 4: session.deleted releases through the real plugin entrypoint.
