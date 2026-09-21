@@ -1,24 +1,8 @@
-diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
---- a/packages/opencode/src/tool/shell.ts
-+++ b/packages/opencode/src/tool/shell.ts
-@@ -314,7 +314,8 @@
-       ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
-         cwd,
-         env,
-+        extendEnv: false,
-         stdin: "ignore",
-         detached: false,
-       }),
-       processClass,
-@@ -325,7 +326,8 @@
-     ChildProcess.make(toolOomCommand(shell, command, env), [], {
-       shell,
-       cwd,
-       env,
-+      extendEnv: false,
-       stdin: "ignore",
-       detached: process.platform !== "win32",
-     }),
+# Retained downstream by explicit decision: the vendor marker, replace
+# contract, OOM re-add, and legacy-tool gate below are Harbor policy and a
+# version gate, not generic runtime behavior. (extendEnv:false on shell
+# spawns already lives in the fork; generic replace exists natively for
+# lsp.env. Unifying shell.env's contract is deferred future work.)
 diff --git a/packages/opencode/src/plugin/shell-environment.ts b/packages/opencode/src/plugin/shell-environment.ts
 --- a/packages/opencode/src/plugin/shell-environment.ts
 +++ b/packages/opencode/src/plugin/shell-environment.ts
