@@ -106,6 +106,28 @@ gate("files outside the root are rejected", async () => {
   }
 });
 
+gate("cancelled requests never spawn a server", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pkl-server-"));
+  await writeFile(path.join(dir, "valid.pkl"), 'name = "world"\n');
+  const servers = createPklServers({ executable: bin, args: ["--stdio"] });
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      servers.hover({
+        sessionID: "s1", root: dir, file: path.join(dir, "valid.pkl"),
+        line: 1, character: 1,
+        resolveEnvironment: async () => ({ env: {}, generation: "g1" }),
+        signal: controller.signal,
+      }),
+      /cancelled/,
+    );
+    assert.deepEqual(await servers.status({ sessionID: "s1", root: dir }), { running: false });
+  } finally {
+    await servers.dispose();
+  }
+});
+
 gate("non-ASCII positions use UTF-16 columns", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pkl-server-"));
   await writeFile(path.join(dir, "uni.pkl"), 'grüße = "hallo"\n');
