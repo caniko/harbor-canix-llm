@@ -59,7 +59,17 @@ export default {
       } catch { throw new Error("Cannot resolve the managed v2 backend credential"); }
     }
     if (!password) throw new Error("Prototype requires OPENCODE_PASSWORD or an absolute managed v2 opencode executable");
-    const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: process.env, direnvApproval: ctx.options.direnvApproval });
+    // A canary isolates OpenCode's own XDG storage, but project commands and
+    // direnv must still see the operator's normal config/approval databases.
+    const projectXdg = ctx.options.projectXdg ?? {};
+    if (typeof projectXdg !== "object" || Array.isArray(projectXdg)) throw new Error("projectXdg must be an object");
+    for (const [name, value] of Object.entries(projectXdg)) {
+      if (!["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"].includes(name)
+          || typeof value !== "string" || !path.isAbsolute(value)) {
+        throw new Error("projectXdg must contain only absolute standard XDG home paths");
+      }
+    }
+    const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: { ...process.env, ...projectXdg }, direnvApproval: ctx.options.direnvApproval });
     const request = async (method, endpoint, body, signal) => {
       const response = await fetch(new URL(endpoint, backend), {
         method,

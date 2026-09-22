@@ -88,6 +88,12 @@ directories. Native v2 owns the 0600 credential file; neither Nix settings nor
 project environments need to contain the password. This mode is not for a
 foreground `serve` instance with an unrelated ephemeral password.
 
+An isolated canary can supply `projectXdg` with absolute `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_STATE_HOME`, and/or `XDG_CACHE_HOME` paths for project
+preparation. This preserves the normal direnv/nix-direnv configuration and
+approval database while the backend keeps its separate OpenCode storage.
+Only these four keys are accepted; the backend process environment is unchanged.
+
 Resolve, select and clear share one session preparation queue and approval
 flow; a selection is committed only after successful preparation. Cancelling
 a queued caller settles it promptly without cancelling its predecessor, and
