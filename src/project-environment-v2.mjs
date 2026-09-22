@@ -1,6 +1,41 @@
 // Feasibility prototype, intentionally not the default package entrypoint.
 // Covers only the registered native shell tool. See project-environment.mjs.
 import { createProjectEnvironments, wrapProjectCommand } from "./project-environment.mjs";
+import { setTimeout as delay } from "node:timers/promises";
+import { randomUUID } from "node:crypto";
+
+export async function waitForEnvironmentApproval({ request, sessionID, approval, signal }) {
+  const endpoint = `/api/session/${encodeURIComponent(sessionID)}/form`;
+  const id = `frm_${randomUUID()}`;
+  let pending = true;
+  try {
+    await request("POST", endpoint, {
+      id,
+      title: "Project environment approval required",
+      metadata: { project: approval.project, envrc: approval.envrc, revision: approval.revision },
+      fields: [{
+        key: "decision", type: "string", required: true, custom: false,
+        title: `Review ${approval.envrc}`,
+        description: `New execution is waiting. Reads and edits remain available; running commands are not cancelled. Review this file and approve it with direnv allow in the project, then retry. Revision: ${approval.revision}. Retrying alone does not grant trust.`,
+        options: [
+          { value: "retry", label: "Approved in direnv — retry" },
+          { value: "deny", label: "Do not run" },
+        ],
+      }],
+    }, signal);
+    for (;;) {
+      signal?.throwIfAborted();
+      if (!await approval.isCurrent()) return "retry";
+      const { state } = (await request("GET", `${endpoint}/${encodeURIComponent(id)}`, undefined, signal)).data;
+      if (state.status === "answered") { pending = false; return state.answer.decision; }
+      if (state.status === "cancelled") { pending = false; return "deny"; }
+      await delay(300, undefined, { signal });
+    }
+  } finally {
+    // Cancel an obsolete/caller-cancelled form independently of its signal.
+    if (pending) await request("DELETE", `${endpoint}/${encodeURIComponent(id)}`).catch(() => {});
+  }
+}
 
 export default {
   id: "canix.project-environment-prototype",
@@ -13,20 +48,25 @@ export default {
     const password = process.env.OPENCODE_PASSWORD;
     if (!password) throw new Error("Prototype requires the managed backend authentication environment");
     const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: process.env });
-    const setEnvironment = async (sessionID, env, signal) => {
-      const response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionID)}/environment`, backend), {
-        method: "PUT",
+    const request = async (method, endpoint, body, signal) => {
+      const response = await fetch(new URL(endpoint, backend), {
+        method,
         headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ variables: env }),
+        body: body === undefined ? undefined : JSON.stringify(body),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
       });
-      if (!response.ok) throw new Error(`Cannot set session environment (${response.status})`);
+      if (!response.ok) throw new Error(`Project environment API request failed (${response.status})`);
+      return response.status === 204 ? undefined : response.json();
     };
+    const setEnvironment = (sessionID, env, signal) => request("PUT", `/api/session/${encodeURIComponent(sessionID)}/environment`, { variables: env }, signal);
     await ctx.tool.transform((editor) => {
       for (const tool of editor.list()) {
         if (tool.name !== "shell") continue;
         editor.update(tool.id, (current) => {
-          current.execute = wrapProjectCommand({ execute: current.execute, environments, setEnvironment, directory: ctx.location.directory });
+          current.execute = wrapProjectCommand({
+            execute: current.execute, environments, setEnvironment, directory: ctx.location.directory,
+            requestApproval: (input) => waitForEnvironmentApproval({ ...input, request }),
+          });
         });
       }
     });

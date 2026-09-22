@@ -79,6 +79,22 @@ uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
 `project-env-clear` (`{"cwd":"/project"}`). Agent-side selection authorization
 is not implemented by this prototype.
 
+The command approval barrier is **lazy**: changing `.envrc` alone does not
+interrupt a session or request approval. Reads/edits remain available and an
+already-running command finishes with its captured environment. The next
+wrapped command that needs an unapproved environment waits on a stock-v2
+session form, before publishing an environment or invoking the executor.
+Queued commands in that session wait behind it; completed work is not replayed.
+
+The form identifies the canonical `.envrc` and its revision. Review and grant
+trust using native `direnv allow`, then choose **Approved in direnv — retry**.
+The form does not grant trust itself: every retry checks direnv again. Editing
+while a form is pending cancels the obsolete form and resolves the current
+revision. Declining rejects the held operation and suppresses repeat prompts
+for that session/revision; it never falls back to the old environment. Caller
+cancellation removes its pending form. This implements an execution barrier,
+not a watcher that pauses reasoning or interrupts active jobs.
+
 **Release blocker, reproduced on stock v2 `b8aa08f2`:** direct
 `POST /api/session/:id/shell` bypasses the registered-tool wrapper. After editing
 `.envrc` without reapproval, the wrapped tool refuses execution but that endpoint

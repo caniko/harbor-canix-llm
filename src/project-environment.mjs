@@ -1,9 +1,29 @@
 import { execFile } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+
+async function revision(file) {
+  return createHash("sha256").update(file).update("\n").update(await readFile(file)).digest("hex");
+}
+
+export class EnvironmentApprovalRequired extends Error {
+  constructor(project, envrc, hash) {
+    super(`Project .envrc needs operator approval: ${envrc}`);
+    this.name = "EnvironmentApprovalRequired";
+    this.project = project;
+    this.envrc = envrc;
+    this.revision = hash;
+  }
+
+  async isCurrent() {
+    try { return await realpath(this.envrc) === this.envrc && await revision(this.envrc) === this.revision; }
+    catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  }
+}
 const inside = (root, target) => {
   const relative = path.relative(root, target);
   return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -60,13 +80,27 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
     if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) throw new Error("Invalid flake shell catalog");
     return { ...project, shells: names };
   }
-  async function capture(project, shell, signal) {
-    const env = { ...base, ...(shell === undefined ? {} : { PROJECT_DEV_SHELL: shell }) };
+  async function requireApproval(project, env, signal) {
     const status = JSON.parse(await run(direnv, ["status", "--json"], project.cwd, env, signal));
     const rc = status.state?.foundRC;
     if (!rc || !inside(project.root, await realpath(rc.path))) throw new Error("Project has no local .envrc; configure it explicitly");
-    if (rc.allowed !== 0) throw new Error(`Project .envrc needs operator approval: ${rc.path}`);
-    const patch = JSON.parse(await run(direnv, ["export", "json"], project.cwd, env, signal));
+    if (rc.allowed !== 0) {
+      const file = await realpath(rc.path);
+      throw new EnvironmentApprovalRequired(project.root, file, await revision(file));
+    }
+  }
+  async function capture(project, shell, signal) {
+    const env = { ...base, ...(shell === undefined ? {} : { PROJECT_DEV_SHELL: shell }) };
+    await requireApproval(project, env, signal);
+    let output;
+    try { output = await run(direnv, ["export", "json"], project.cwd, env, signal); }
+    catch (error) {
+      // A definition can change between status and export. Turn a revoked
+      // approval into the same barrier; preserve unrelated evaluation errors.
+      await requireApproval(project, env, signal);
+      throw error;
+    }
+    const patch = JSON.parse(output);
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("Invalid direnv environment patch");
     for (const [name, value] of Object.entries(patch)) {
       if (value === null) delete env[name];
@@ -108,15 +142,39 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
 // A bounded prototype: this wrapper covers the native registered shell tool,
 // not user-shell endpoints, PTYs or formatters. Keep it out of production
 // until those paths have an equivalent supported interception boundary.
-export function wrapProjectCommand({ execute, environments, setEnvironment, directory }) {
+export function wrapProjectCommand({ execute, environments, setEnvironment, directory, requestApproval }) {
   const pending = new Map();
+  const denied = new Set();
   return async (input, context) => {
     const previous = pending.get(context.sessionID) ?? Promise.resolve();
     const next = previous.catch(() => {}).then(async () => {
       context.signal?.throwIfAborted();
       const cwd = path.resolve(directory, input.workdir ?? ".");
-      const snapshot = await environments.resolve({ sessionID: context.sessionID, cwd, signal: context.signal });
+      let snapshot;
+      for (;;) {
+        context.signal?.throwIfAborted();
+        try {
+          snapshot = await environments.resolve({ sessionID: context.sessionID, cwd, signal: context.signal });
+          break;
+        } catch (error) {
+          if (!(error instanceof EnvironmentApprovalRequired) || !requestApproval) throw error;
+          const id = JSON.stringify([context.sessionID, error.envrc, error.revision]);
+          if (denied.has(id)) throw new Error(`Project environment approval was declined: ${error.envrc}`);
+          if (!await error.isCurrent()) continue;
+          const answer = await requestApproval({ sessionID: context.sessionID, approval: error, signal: context.signal });
+          context.signal?.throwIfAborted();
+          if (answer === "deny") {
+            denied.add(id);
+            throw new Error(`Project environment approval was declined: ${error.envrc}`);
+          }
+          if (answer !== "retry") throw new Error("Invalid project environment approval response");
+          // A form answer is not direnv approval. Resolve again and require
+          // the native trust state for the current file before executing.
+        }
+      }
+      context.signal?.throwIfAborted();
       await setEnvironment(context.sessionID, snapshot.env, context.signal);
+      context.signal?.throwIfAborted();
       // ponytail: serialize foreground calls through completion because the
       // public executor has no atomic spawn-with-env API. Per-invocation
       // native environments are the upgrade path for concurrent execution.

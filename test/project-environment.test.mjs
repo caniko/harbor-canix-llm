@@ -116,3 +116,85 @@ test("two projects in one session are serialized through delegated execution", i
   ]), ["a", "b"]);
   assert.deepEqual(seen, ["a:default", "b:default"]);
 });
+
+test("edits are lazy; current execution finishes and queued work waits for direnv approval", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t);
+  let finish, started, asked, answer;
+  const running = new Promise((resolve) => { started = resolve; });
+  const release = new Promise((resolve) => { finish = resolve; });
+  const prompted = new Promise((resolve) => { asked = resolve; });
+  const decision = new Promise((resolve) => { answer = resolve; });
+  let prompts = 0;
+  const executed = [];
+  const execute = wrapProjectCommand({
+    directory: cwd, environments, setEnvironment: async () => {},
+    requestApproval: async ({ approval }) => { prompts++; asked(approval); return decision; },
+    execute: async (input) => {
+      executed.push(input.command);
+      if (input.command === "running") { started(); await release; }
+      return input.command;
+    },
+  });
+  const context = { sessionID: "one", signal: new AbortController().signal };
+  const first = execute({ command: "running" }, context);
+  await running;
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="intermediate"\n');
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="finished-edit"\n');
+  assert.equal(prompts, 0);
+  finish();
+  assert.equal(await first, "running");
+  assert.equal(prompts, 0);
+  const second = execute({ command: "next" }, context);
+  const third = execute({ command: "queued" }, context);
+  const approval = await prompted;
+  assert.equal(await approval.isCurrent(), true);
+  assert.equal(prompts, 1);
+  assert.deepEqual(executed, ["running"]);
+  // An explicit operator action grants native direnv trust, not the form.
+  await exec(direnv, ["allow", cwd], { env: baseline });
+  answer("retry");
+  assert.deepEqual(await Promise.all([second, third]), ["next", "queued"]);
+  assert.deepEqual(executed, ["running", "next", "queued"]);
+  assert.equal(prompts, 1);
+});
+
+test("declined revision is not repeatedly prompted or executed", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="changed"\n');
+  let prompts = 0;
+  const execute = wrapProjectCommand({
+    directory: cwd, environments,
+    setEnvironment: async () => assert.fail("must not publish an environment"),
+    execute: async () => assert.fail("must not execute"),
+    requestApproval: async () => { prompts++; return "deny"; },
+  });
+  const context = { sessionID: "one", signal: new AbortController().signal };
+  await assert.rejects(execute({}, context), /declined/);
+  await assert.rejects(execute({}, context), /declined/);
+  assert.equal(prompts, 1);
+});
+
+test("retry alone grants no trust; editing invalidates the displayed revision", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="first"\n');
+  let prompts = 0;
+  let previous;
+  const execute = wrapProjectCommand({
+    directory: cwd, environments,
+    setEnvironment: async () => assert.fail("must not publish an environment"),
+    execute: async () => assert.fail("must not execute"),
+    requestApproval: async ({ approval }) => {
+      prompts++;
+      if (prompts === 1) {
+        previous = approval;
+        await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="second"\n');
+        assert.equal(await approval.isCurrent(), false);
+        return "retry";
+      }
+      assert.notEqual(approval.revision, previous.revision);
+      return "deny";
+    },
+  });
+  await assert.rejects(execute({}, { sessionID: "one" }), /declined/);
+  assert.equal(prompts, 2);
+});
