@@ -46,6 +46,58 @@ remains pinned. There is no implicit "trust all future shell revisions" mode.
 
 ## Home Manager
 
+### Project-direnv prototype for v2
+
+`plugins/project-environment-prototype` is an **unconfigured feasibility
+prototype**, not a replacement for the production adapter. It selects by
+session and canonical flake root, discovers derivation-valued
+`devShells.<system>` attributes, and runs the project's approved `.envrc` from
+a clean, fixed baseline for each command. Selection does not edit project
+files or call `direnv allow`.
+
+Owned projects can opt into named selection with an `.envrc` convention:
+
+```bash
+use flake ".#${PROJECT_DEV_SHELL:-default}"
+export PROJECT_DEV_SHELL_ACTIVE="${PROJECT_DEV_SHELL:-default}"
+```
+
+Default/clear omits the selector; the project chooses its normal default.
+The acknowledgement prevents silently ignoring a requested shell. Existing
+`.envrc` exports/hooks remain authoritative. Unapproved files, failed captures,
+missing choices and nix-direnv stale fallbacks reject the operation. Commands
+capture the environment for their launch directory; a later `cd` does not
+change it. Non-flake projects can use approved direnv but have no shell menu.
+
+The prototype decorates the native registered `shell` executor using public
+v2 APIs and publishes the snapshot through the native session-environment API.
+Foreground calls serialize through completion because that executor exposes
+no atomic per-invocation environment/spawn operation. Options are `roots`,
+absolute `direnv`/`nix` paths, `system`, and a loopback `serverURL`; authentication
+uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
+`project-env-select` (`{"cwd":"/project","shell":"docs"}`) and
+`project-env-clear` (`{"cwd":"/project"}`). Agent-side selection authorization
+is not implemented by this prototype.
+
+**Release blocker, reproduced on stock v2 `b8aa08f2`:** direct
+`POST /api/session/:id/shell` bypasses the registered-tool wrapper. After editing
+`.envrc` without reapproval, the wrapped tool refuses execution but that endpoint
+still runs with its old environment. PTYs and formatter subprocesses are also
+outside this wrapper's coverage. Do not enable it as an all-commands policy.
+
+The native `shell.create.before` hook reaches the direct shell path, but lacks
+session identity in the inspected public API (also checked at upstream
+`19e1357a06e1732a8a08c848e2a7d92e982dc8d0`). A supported invocation-scoped
+environment boundary carrying session identity is needed to enforce selection
+there without session-global environment swapping. Keep native authorization,
+cancellation and containment when adding that upstream capability; formatter
+and PTY coverage require their own verification. No core patch is shipped here.
+
+The Nix `environments` check supplies real direnv/Nix/Pkl binaries. Local resolver
+tests run with `DIRENV_BIN=/absolute/direnv NIX_BIN=/absolute/nix node --test
+test/project-environment.test.mjs`. Fixture flakes are evaluated but not built;
+they test catalog selection and `.envrc` behavior, not nix-direnv realization.
+
 ### OpenCode v2 Pkl canary
 
 The v1 environment adapter below is not the v2 entrypoint. For stock v2,

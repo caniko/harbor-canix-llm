@@ -81,7 +81,8 @@
         cp -r ${./src} src
         cp -r ${./test} test
         ln -s ${self.packages.${system}.default}/lib/harbor-canix-llm/node_modules node_modules
-        PKL_LSP_BIN=${pklLsp}/bin/pkl-lsp node --test test/*.test.mjs
+        DIRENV_BIN=${pkgs.direnv}/bin/direnv NIX_BIN=${pkgs.nix}/bin/nix \
+          PKL_LSP_BIN=${pklLsp}/bin/pkl-lsp node --test test/*.test.mjs
         touch $out
       '';
       plugin = pkgs.runCommand "harbor-canix-llm-plugin" {nativeBuildInputs = [pkgs.nodejs];} ''
