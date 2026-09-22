@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -31,8 +31,11 @@ const inside = (root, target) => {
 
 // Selection metadata only. Every launch asks direnv to evaluate from the
 // same baseline; nix-direnv owns its build cache and watch invalidation.
-export function createProjectEnvironments({ roots, direnv, nix, system, baseline, direnvApproval = "auto" }) {
+export function createProjectEnvironments({ roots, direnv, nix, system, baseline, direnvApproval = "auto", preparationTimeoutMs = 600_000, onProgress, setsid = "setsid" }) {
   if (!["auto", "manual"].includes(direnvApproval)) throw new Error("direnvApproval must be auto or manual");
+  if (!Number.isSafeInteger(preparationTimeoutMs) || preparationTimeoutMs <= 0 || preparationTimeoutMs > 3_600_000) {
+    throw new Error("preparationTimeoutMs must be a positive integer no greater than 3600000");
+  }
   if (!roots?.length || ![...roots, direnv, nix].every((p) => typeof p === "string" && path.isAbsolute(p))) {
     throw new Error("Project environments require absolute roots and executable paths");
   }
@@ -45,13 +48,47 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
     if (typeof sessionID !== "string" || !sessionID) throw new Error("Session identity is required");
     return JSON.stringify([sessionID, root]);
   };
-  async function run(binary, args, cwd, env, signal) {
+  async function run(binary, args, cwd, env, signal, detail = {}) {
+    const timeoutMs = args[0] === "export" ? preparationTimeoutMs : args[0] === "eval" ? 120_000 : 10_000;
+    const progress = { preparationID: randomUUID(), phase: `${path.basename(binary)} ${args[0]}`, cwd, timeoutMs, ...detail };
+    const started = performance.now();
+    const deadline = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; deadline.abort(); }, timeoutMs);
+    const combined = AbortSignal.any([deadline.signal, ...(signal ? [signal] : [])]);
+    let child, closed;
     try {
-      return (await exec(binary, args, { cwd, env, signal, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 })).stdout;
+      combined.throwIfAborted();
+      onProgress?.({ ...progress, status: "preparing" });
+      // execFile does not forward a `detached` option. Linux setsid gives
+      // this preparation its own process group while retaining stdlib limits.
+      const grouped = process.platform === "linux";
+      const execution = exec(grouped ? setsid : binary, grouped ? ["--", binary, ...args] : args, { cwd, env, signal: combined, maxBuffer: 8 * 1024 * 1024 });
+      child = execution.child;
+      closed = new Promise((resolve) => child.once("close", resolve));
+      const result = await execution;
+      onProgress?.({ ...progress, status: "ready", elapsedMs: Math.round(performance.now() - started) });
+      return result.stdout;
     } catch (error) {
+      // A timed-out direnv can leave its bash/Nix children alive. Reap this
+      // preparation's private process group, never the caller's running jobs.
+      if (child?.pid) {
+        try { process.kill(process.platform === "linux" ? -child.pid : child.pid, "SIGKILL"); }
+        catch (killError) { if (killError.code !== "ESRCH") throw new Error("Cannot terminate failed environment preparation"); }
+      }
+      if (closed) await closed;
       // Hook output can contain credentials. Never forward stdout/stderr.
-      if (signal?.aborted) throw new Error("Project environment preparation cancelled");
-      throw new Error(`${path.basename(binary)} failed while preparing the project environment (${error.code ?? "error"})`);
+      const reason = signal?.aborted ? "cancelled" : timedOut ? "timeout"
+        : error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? "output limit exceeded"
+          : error.signal ? `terminated by ${error.signal}` : `exit ${error.code ?? "unknown"}`;
+      const result = { ...progress, status: "failed", reason, elapsedMs: Math.round(performance.now() - started) };
+      onProgress?.(result);
+      const failure = new Error(`Project environment preparation failed: ${result.phase}; cwd=${cwd}; envrc=${detail.envrc ?? "not yet resolved"}; approval=${detail.approval ?? "not yet checked"}; ${reason}; elapsed=${result.elapsedMs}ms; limit=${timeoutMs}ms; preparation=${progress.preparationID}`);
+      failure.code = signal?.aborted ? "CANCELLED" : timedOut ? "TIMEOUT" : "PREPARATION_FAILED";
+      failure.preparation = result;
+      throw failure;
+    } finally {
+      clearTimeout(timer);
     }
   }
   async function projectAt(cwd) {
@@ -86,7 +123,7 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
       const status = JSON.parse(await run(direnv, ["status", "--json"], project.cwd, env, signal));
       const rc = status.state?.foundRC;
       if (!rc || !inside(project.root, await realpath(rc.path))) throw new Error("Project has no local .envrc; configure it explicitly");
-      if (rc.allowed === 0) return;
+      if (rc.allowed === 0) return await realpath(rc.path);
       if (![1, 2].includes(rc.allowed)) throw new Error("Unknown direnv approval state");
       const file = await realpath(rc.path);
       const approval = new EnvironmentApprovalRequired(project.root, file, await revision(file));
@@ -94,19 +131,20 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
       if (direnvApproval === "manual" || rc.allowed === 2) throw approval;
       if (!await approval.isCurrent()) continue;
       signal?.throwIfAborted();
-      await run(direnv, ["allow", file], project.cwd, env, signal);
+      await run(direnv, ["allow", file], project.cwd, env, signal, { envrc: file, approval: "unapproved" });
       // Re-read native trust after allow; never export based on an old status.
     }
     throw new Error("Project .envrc approval did not stabilize; retry preparation");
   }
   async function capture(project, shell, signal) {
     const env = { ...base, ...(shell === undefined ? {} : { PROJECT_DEV_SHELL: shell }) };
-    await requireApproval(project, env, signal);
+    const envrc = await requireApproval(project, env, signal);
     let output;
-    try { output = await run(direnv, ["export", "json"], project.cwd, env, signal); }
+    try { output = await run(direnv, ["export", "json"], project.cwd, env, signal, { envrc, approval: "approved" }); }
     catch (error) {
       // A definition can change between status and export. Turn a revoked
       // approval into the same barrier; preserve unrelated evaluation errors.
+      if (error.code === "CANCELLED" || error.code === "TIMEOUT") throw error;
       await requireApproval(project, env, signal);
       throw error;
     }

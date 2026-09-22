@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -47,6 +47,82 @@ unset PROJECT_TEST_BASE
 
 test("invalid approval mode fails configuration validation", () => {
   assert.throws(() => createProjectEnvironments({ direnvApproval: "always" }), /auto or manual/);
+});
+
+test("preparation deadline configuration rejects invalid values", () => {
+  for (const preparationTimeoutMs of [0, -1, 1.5, Infinity, "600000", 3_600_001]) {
+    assert.throws(() => createProjectEnvironments({ preparationTimeoutMs }), /preparationTimeoutMs/);
+  }
+});
+
+test("approved export failure reports its phase without exposing hook output", integration, async (t) => {
+  const events = [];
+  const { projects: [cwd], environments } = await fixture(t, { direnvApproval: "auto", onProgress: (event) => events.push(event) });
+  await writeFile(path.join(cwd, ".envrc"), 'echo SECRET_SENTINEL_DO_NOT_LOG >&2\nexit 19\n');
+  await assert.rejects(environments.resolve({ sessionID: "a", cwd }), (error) => {
+    assert.equal(error.code, "PREPARATION_FAILED");
+    assert.equal(error.preparation.phase, "direnv export");
+    assert.equal(error.preparation.approval, "approved");
+    assert.equal(error.preparation.envrc, path.join(cwd, ".envrc"));
+    // direnv normalizes the .envrc failure to its own exit code 1.
+    assert.match(error.message, /exit 1/);
+    assert.doesNotMatch(error.message, /SECRET_SENTINEL/);
+    return true;
+  });
+  assert.ok(events.some(event => event.phase === "direnv allow" && event.status === "ready"));
+  assert.doesNotMatch(JSON.stringify(events), /SECRET_SENTINEL/);
+});
+
+test("preparation timeout is distinct from approval and reaps helper processes", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t, { direnvApproval: "auto", preparationTimeoutMs: 500 });
+  await writeFile(path.join(cwd, ".envrc"), `sleep 30 &\necho $! > ${JSON.stringify(path.join(cwd, "helper.pid"))}\nwait\n`);
+  await assert.rejects(environments.resolve({ sessionID: "a", cwd }), (error) => {
+    assert.equal(error.code, "TIMEOUT");
+    assert.equal(error.preparation.phase, "direnv export");
+    assert.equal(error.preparation.approval, "approved");
+    assert.equal(error.preparation.timeoutMs, 500);
+    assert.ok(error.preparation.elapsedMs >= 490);
+    return true;
+  });
+  const pid = Number(await readFile(path.join(cwd, "helper.pid"), "utf8"));
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") return; throw error; }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const state = await readFile(`/proc/${pid}/stat`, "utf8");
+  assert.fail(`timed-out preparation left helper ${pid}: ${state.slice(state.lastIndexOf(")") + 2).split(" ").slice(0,3).join(" ")}`);
+});
+
+test("slow successful export emits safe progress and respects the configured deadline", integration, async (t) => {
+  const events = [];
+  const { projects: [cwd], environments } = await fixture(t, { direnvApproval: "auto", preparationTimeoutMs: 3000, onProgress: event => events.push(event) });
+  await writeFile(path.join(cwd, ".envrc"), 'sleep 0.2\nexport PROJECT_TEST="prepared"\n');
+  assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "prepared");
+  const exportEvents = events.filter(event => event.phase === "direnv export");
+  assert.deepEqual(exportEvents.map(event => event.status), ["preparing", "ready"]);
+  assert.equal(exportEvents[0].preparationID, exportEvents[1].preparationID);
+  assert.equal(exportEvents[1].cwd, cwd);
+});
+
+test("cancelling an active export is reported as cancellation, not timeout", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t, { direnvApproval: "auto", preparationTimeoutMs: 5000 });
+  await writeFile(path.join(cwd, ".envrc"), `echo started > ${JSON.stringify(path.join(cwd, "started"))}\nsleep 30\n`);
+  const controller = new AbortController();
+  const rejected = assert.rejects(environments.resolve({ sessionID: "a", cwd, signal: controller.signal }), (error) => {
+    assert.equal(error.code, "CANCELLED");
+    assert.equal(error.preparation.reason, "cancelled");
+    assert.equal(error.preparation.phase, "direnv export");
+    return true;
+  });
+  let started = false;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    try { await readFile(path.join(cwd, "started")); started = true; break; }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  controller.abort();
+  await rejected;
+  assert.equal(started, true);
 });
 
 test("auto is default and approves only when preparation is requested", integration, async (t) => {

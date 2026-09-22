@@ -69,7 +69,17 @@ export default {
         throw new Error("projectXdg must contain only absolute standard XDG home paths");
       }
     }
-    const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: { ...process.env, ...projectXdg }, direnvApproval: ctx.options.direnvApproval });
+    const environments = createProjectEnvironments({
+      roots, direnv, nix, system, baseline: { ...process.env, ...projectXdg },
+      direnvApproval: ctx.options.direnvApproval,
+      preparationTimeoutMs: ctx.options.preparationTimeoutMs,
+      setsid: ctx.options.setsid,
+      onProgress: (progress) => {
+        if (progress.phase.endsWith(" export") || progress.status === "failed") {
+          console.info("project-environment", JSON.stringify(progress));
+        }
+      },
+    });
     const request = async (method, endpoint, body, signal) => {
       const response = await fetch(new URL(endpoint, backend), {
         method,
@@ -92,6 +102,14 @@ export default {
       }
       const snapshot = await barrier.resolve(invocation);
       invocation.env = { ...snapshot.env, TERM: invocation.env.TERM, OPENCODE_TERMINAL: "1" };
+    });
+    await ctx.tool.transform((editor) => {
+      for (const tool of editor.list()) {
+        if (tool.name !== "shell") continue;
+        editor.update(tool.id, (current) => {
+          current.description += "\nProject environment is resolved from the launch workdir. Set workdir explicitly when working in another project; cd inside the command does not select that project's direnv environment.";
+        });
+      }
     });
     // Explicit operator slash commands use the same configured approval mode.
     // The prototype does not expose selection as an agent-side tool.

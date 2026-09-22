@@ -101,8 +101,8 @@ the cancelled operation never starts later. Session deletion cancels preparation
 and releases choices. A session move or plugin reload resets choices to project
 defaults; environment snapshots and choices are not persisted. Plugin unload
 aborts preparation and closes its lifecycle subscription. Running commands keep
-their already-captured snapshots. This does not yet share selection with the
-separate Pkl MCP process.
+their already-captured snapshots. Selection applies to the native shell hook;
+other execution paths require their own supported integration.
 
 `direnvApproval` accepts `"auto"` (the default) or `"manual"`. In auto mode,
 preparing an environment automatically runs native `direnv allow` for a new or
@@ -120,6 +120,21 @@ already-running command finishes with its captured environment. The next
 command that needs an unapproved environment waits on a v2 session form before
 spawning. Other preparation in that session waits behind it; existing processes
 continue and completed work is not replayed.
+
+`preparationTimeoutMs` bounds direnv export (default 600000 ms / ten minutes,
+maximum one hour). Approval/status checks remain bounded at ten seconds and
+flake catalog evaluation at two minutes. Safe progress logs identify the phase,
+launch directory, effective `.envrc`, trust state and preparation ID; failures
+distinguish timeout, cancellation, buffer overflow, exit code and termination
+signal without exposing hook output or environment values. Linux preparation
+uses `setsid` (optionally an absolute configured `setsid` path) so cancellation
+also terminates its helper processes. This does not cancel running commands.
+
+Use the shell tool's `workdir` field for another project. A `cd` inside the
+command changes its eventual directory but does not select another environment:
+preparation has already occurred at launch. The native shell description includes
+this guidance. Approval and successful environment evaluation are separate gates;
+auto approval cannot repair a failed Nix evaluation, download or build.
 
 In manual mode (or after explicit denial), the form identifies the canonical `.envrc` and its revision. Review and grant
 trust using native `direnv allow`, then choose **Approved in direnv — retry**.
@@ -161,34 +176,15 @@ tests direct-shell approval plus native permission denial, and preserves its
 redacted backend log. `PROJECT_ENV_PLUGIN` may select an exact packaged plugin
 directory. It does not open production state or issue provider requests.
 
-The Nix `environments` check supplies real direnv/Nix/Pkl binaries. Local resolver
+The Nix `environments` check supplies real direnv/Nix binaries. Local resolver
 tests run with `DIRENV_BIN=/absolute/direnv NIX_BIN=/absolute/nix node --test
 test/project-environment.test.mjs`. Fixture flakes are evaluated but not built;
 they test catalog selection and `.envrc` behavior, not nix-direnv realization.
 
-### OpenCode v2 Pkl canary
+The experimental Pkl MCP plugin has been removed. This package owns project
+environment preparation, not a separate language-server implementation.
 
-The v1 environment adapter below is not the v2 entrypoint. For stock v2,
-configure the packaged **directory** `lib/harbor-canix-llm/plugins/pkl` as
-a plugin, with `node`, `executable`, and `roots` options containing absolute
-operator-supplied paths. The plugin registers a local stdio MCP server through
-`ctx.mcp.transform`; it does not register direct custom tools or patch OpenCode.
-
-The native v2 MCP executor owns tool approval. Calls supply session identity
-through `ai.opencode/sessionID` metadata, not model arguments. Missing metadata
-is rejected. The implementation provides `pkl_hover`, `pkl_diagnostics`, and
-`pkl_status` for saved files within configured roots. Roots bound direct file
-access; they are not an OS sandbox or a guarantee about Pkl imports. Approval
-authorizes the Pkl operation, not a promise to enforce every native read rule.
-
-This is a canary integration: Harbor-selected environments and session-deletion
-cleanup are not yet wired into the MCP process. It currently uses its baseline
-environment and releases servers when the MCP connection closes. Do not replace
-the production v1 environment adapter with this entrypoint.
-
-Run `canix cache build .#checks.x86_64-linux.environments` to execute the tests
-with packaged dependencies and the real pinned Pkl server. Direct local tests
-also support `PKL_LSP_BIN=/absolute/path/pkl-lsp node --test test/*.test.mjs`.
+### V1 environment adapter
 
 After publishing and locking this flake, import
 `inputs.harbor-canix-llm.homeManagerModules.default`. Minimal consumer:

@@ -15,19 +15,23 @@ test("native integration registers a shell hook and rejects unsupported executio
     else process.env.OPENCODE_PASSWORD = before;
   });
   let prepare;
+  const execute = () => {};
+  const shellTool = { id: "native-shell", name: "shell", description: "Native shell", execute };
   const deleted = Promise.withResolvers();
   const dispose = await plugin.setup({
     options: { roots: ["/fixture"], direnv: "/fixture/direnv", nix: "/fixture/nix", system: "x86_64-linux", serverURL: "http://127.0.0.1:1" },
     location: { directory: "/fixture" },
     shell: { hook: async (name, callback) => { assert.equal(name, "create.before"); prepare = callback; } },
     command: { transform: async () => {} },
+    tool: { transform: async (register) => register({ list: () => [shellTool], update: (_, change) => change(shellTool) }) },
     event: { async *subscribe({ signal }) {
       yield { type: "session.deleted", data: { sessionID: "ses_deleted" } };
       deleted.resolve();
       await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
     } },
-    // No tool-transform domain: the plugin must not wrap the native tool.
   });
+  assert.equal(shellTool.execute, execute);
+  assert.match(shellTool.description, /Set workdir explicitly/);
   t.after(dispose);
   await deleted.promise;
   await assert.rejects(prepare({ sessionID: "ses_deleted", cwd: "/fixture", env: {}, signal: new AbortController().signal }), /unavailable/);
@@ -57,6 +61,7 @@ test("project XDG paths preserve native direnv trust without changing backend st
     location: { directory: root },
     shell: { hook: async (_, callback) => { prepare = callback; } },
     command: { transform: async () => {} },
+    tool: { transform: async () => {} },
     event: { async *subscribe({ signal }) { await new Promise(resolve => signal.addEventListener("abort", resolve, {once:true})); } },
   });
   t.after(dispose);

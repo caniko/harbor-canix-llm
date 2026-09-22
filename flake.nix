@@ -53,36 +53,13 @@
     });
     checks = forSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      pklLsp = pkgs.stdenvNoCC.mkDerivation rec {
-        pname = "pkl-lsp";
-        version = "0.2.1";
-        src = pkgs.fetchurl {
-          url = "https://codeberg.org/caniko/pkl-lsp/releases/download/${version}/pkl-lsp-${version}-${
-            if system == "x86_64-linux"
-            then "linux-x64"
-            else if system == "aarch64-linux"
-            then "linux-arm64"
-            else throw "unsupported system ${system}"
-          }.tar.gz";
-          hash =
-            if system == "x86_64-linux"
-            then "sha256-n+eUZLWOeLeUE5HN8Pco7QX+5h6AVgvlUuxQdhg8ODo="
-            else "sha256-+QmDfHf+6+pbo0oOwwx6huMvk67NgVybqNuU56ZcbtE=";
-        };
-        dontUnpack = true;
-        installPhase = ''
-          mkdir -p $out/bin
-          tar -xzf $src -C $out/bin
-          chmod +x $out/bin/pkl-lsp
-        '';
-      };
     in {
-      environments = pkgs.runCommand "harbor-canix-llm-environments" {nativeBuildInputs = [pkgs.nodejs];} ''
+      environments = pkgs.runCommand "harbor-canix-llm-environments" {nativeBuildInputs = [pkgs.nodejs pkgs.util-linux];} ''
         cp -r ${./src} src
         cp -r ${./test} test
         ln -s ${self.packages.${system}.default}/lib/harbor-canix-llm/node_modules node_modules
         DIRENV_BIN=${pkgs.direnv}/bin/direnv NIX_BIN=${pkgs.nix}/bin/nix \
-          PKL_LSP_BIN=${pklLsp}/bin/pkl-lsp node --test test/*.test.mjs
+          node --test test/*.test.mjs
         touch $out
       '';
       plugin = pkgs.runCommand "harbor-canix-llm-plugin" {nativeBuildInputs = [pkgs.nodejs];} ''
