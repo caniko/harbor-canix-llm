@@ -69,10 +69,12 @@ missing choices and nix-direnv stale fallbacks reject the operation. Commands
 capture the environment for their launch directory; a later `cd` does not
 change it. Non-flake projects can use approved direnv but have no shell menu.
 
-The prototype decorates the native registered `shell` executor using public
-v2 APIs and publishes the snapshot through the native session-environment API.
-Foreground calls serialize through completion because that executor exposes
-no atomic per-invocation environment/spawn operation. Options are `roots`,
+The prototype now uses a **proposed upstream shell hook API** with native
+`sessionID` and a preparation `AbortSignal`. It sets the invocation's environment
+directly: no session-global environment swapping, no shell-tool replacement,
+and no serialization of running foreground commands. Preparation alone is
+serialized per session so pending manual approvals are not duplicated.
+Old upstream events lacking that context fail closed. Options are `roots`,
 absolute `direnv`/`nix` paths, `system`, and a loopback `serverURL`; authentication
 uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
 `project-env-select` (`{"cwd":"/project","shell":"docs"}`) and
@@ -92,9 +94,9 @@ Invalid modes fail configuration validation. In both modes preparation is
 **lazy**: changing `.envrc` alone does not
 interrupt a session or request approval. Reads/edits remain available and an
 already-running command finishes with its captured environment. The next
-wrapped command that needs an unapproved environment waits on a stock-v2
-session form, before publishing an environment or invoking the executor.
-Queued commands in that session wait behind it; completed work is not replayed.
+command that needs an unapproved environment waits on a v2 session form before
+spawning. Other preparation in that session waits behind it; existing processes
+continue and completed work is not replayed.
 
 In manual mode (or after explicit denial), the form identifies the canonical `.envrc` and its revision. Review and grant
 trust using native `direnv allow`, then choose **Approved in direnv — retry**.
@@ -105,19 +107,30 @@ for that session/revision; it never falls back to the old environment. Caller
 cancellation removes its pending form. This implements an execution barrier,
 not a watcher that pauses reasoning or interrupts active jobs.
 
-**Release blocker, reproduced on stock v2 `b8aa08f2`:** direct
-`POST /api/session/:id/shell` bypasses the registered-tool wrapper. After editing
-`.envrc` in manual mode without reapproval, the wrapped tool waits but that endpoint
-still runs with its old environment. PTYs and formatter subprocesses are also
-outside this wrapper's coverage. Do not enable it as an all-commands policy.
+**Upstream dependency:** proposal `e11f63b2f743dc37da7621408a5b5486e2a9b2b4`
+on [shell-hook-context](https://github.com/caniko/opencode/tree/shell-hook-context),
+based on upstream `b8aa08f260130452dc87fbc20c2a4e2ff743e642`. It exposes validated
+session identity and cancellation in both Promise and Effect shell APIs. Native
+tests cover direct-user-shell identity and interruption before spawn. It is a
+contribution branch, **not an upstream merge or a production dependency**.
 
-The native `shell.create.before` hook reaches the direct shell path, but lacks
-session identity in the inspected public API (also checked at upstream
-`19e1357a06e1732a8a08c848e2a7d92e982dc8d0`). A supported invocation-scoped
-environment boundary carrying session identity is needed to enforce selection
-there without session-global environment swapping. Keep native authorization,
-cancellation and containment when adding that upstream capability; formatter
-and PTY coverage require their own verification. No core patch is shipped here.
+The old registered-tool wrapper's direct-shell bypass is closed in that modified
+candidate: both paths now wait at the same hook, and native command denial still
+prevents side effects. This is not evidence that unmodified upstream is ready.
+PTYs and formatters still need equivalent context/coverage; this entrypoint is
+not yet an all-commands production policy. Canix does not apply this core patch.
+
+Run the model-free native-executor canary against an explicit candidate:
+
+```sh
+node test/check-project-environment-v2.mjs /absolute/opencode /absolute/direnv /absolute/nix
+```
+
+For source testing, set `OPENCODE_SOURCE=/checkout` and pass the declared Bun
+executable instead of `opencode`. The check uses isolated state and fixtures,
+tests direct-shell approval plus native permission denial, and preserves its
+redacted backend log. `PROJECT_ENV_PLUGIN` may select an exact packaged plugin
+directory. It does not open production state or issue provider requests.
 
 The Nix `environments` check supplies real direnv/Nix/Pkl binaries. Local resolver
 tests run with `DIRENV_BIN=/absolute/direnv NIX_BIN=/absolute/nix node --test

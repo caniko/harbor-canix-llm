@@ -1,6 +1,6 @@
 // Feasibility prototype, intentionally not the default package entrypoint.
-// Covers only the registered native shell tool. See project-environment.mjs.
-import { createProjectEnvironments, wrapProjectCommand } from "./project-environment.mjs";
+// Requires the proposed session-aware shell hook. PTYs/formatters are not covered.
+import { createProjectEnvironments, createEnvironmentBarrier } from "./project-environment.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 
@@ -58,17 +58,18 @@ export default {
       if (!response.ok) throw new Error(`Project environment API request failed (${response.status})`);
       return response.status === 204 ? undefined : response.json();
     };
-    const setEnvironment = (sessionID, env, signal) => request("PUT", `/api/session/${encodeURIComponent(sessionID)}/environment`, { variables: env }, signal);
-    await ctx.tool.transform((editor) => {
-      for (const tool of editor.list()) {
-        if (tool.name !== "shell") continue;
-        editor.update(tool.id, (current) => {
-          current.execute = wrapProjectCommand({
-            execute: current.execute, environments, setEnvironment, directory: ctx.location.directory,
-            requestApproval: (input) => waitForEnvironmentApproval({ ...input, request }),
-          });
-        });
+    const resolve = createEnvironmentBarrier({
+      environments,
+      requestApproval: (input) => waitForEnvironmentApproval({ ...input, request }),
+    });
+    await ctx.shell.hook("create.before", async (invocation) => {
+      // Requires the proposed native execution-context API. Old upstream
+      // events fail closed; never invent a session or borrow another's env.
+      if (!invocation.sessionID || !invocation.signal) {
+        throw new Error("Project environments require the session-aware native shell hook API");
       }
+      const snapshot = await resolve(invocation.cwd, invocation);
+      invocation.env = { ...snapshot.env, TERM: invocation.env.TERM, OPENCODE_TERMINAL: "1" };
     });
     // Explicit operator slash commands use the same configured approval mode.
     // The prototype does not expose selection as an agent-side tool.

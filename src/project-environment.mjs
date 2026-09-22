@@ -149,17 +149,12 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
   };
 }
 
-// A bounded prototype: this wrapper covers the native registered shell tool,
-// not user-shell endpoints, PTYs or formatters. Keep it out of production
-// until those paths have an equivalent supported interception boundary.
-export function wrapProjectCommand({ execute, environments, setEnvironment, directory, requestApproval }) {
-  const pending = new Map();
+// Reusable preparation barrier; native hooks consume its immutable snapshot.
+export function createEnvironmentBarrier({ environments, requestApproval }) {
   const denied = new Set();
-  return async (input, context) => {
-    const previous = pending.get(context.sessionID) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(async () => {
+  const preparing = new Map();
+  const resolve = async (cwd, context) => {
       context.signal?.throwIfAborted();
-      const cwd = path.resolve(directory, input.workdir ?? ".");
       let snapshot;
       for (;;) {
         context.signal?.throwIfAborted();
@@ -183,6 +178,28 @@ export function wrapProjectCommand({ execute, environments, setEnvironment, dire
         }
       }
       context.signal?.throwIfAborted();
+      return snapshot;
+  };
+  return async (cwd, context) => {
+    // Serialize preparation only: one pending approval per session, but a
+    // running command never holds this queue or mutates another's snapshot.
+    const previous = preparing.get(context.sessionID) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(() => resolve(cwd, context));
+    preparing.set(context.sessionID, next);
+    try { return await next; }
+    finally { if (preparing.get(context.sessionID) === next) preparing.delete(context.sessionID); }
+  };
+}
+
+// Retained only for the old-wrapper regression tests. The native hook plugin
+// above no longer swaps a session-global environment or serializes execution.
+export function wrapProjectCommand({ execute, environments, setEnvironment, directory, requestApproval }) {
+  const pending = new Map();
+  const resolve = createEnvironmentBarrier({ environments, requestApproval });
+  return async (input, context) => {
+    const previous = pending.get(context.sessionID) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(async () => {
+      const snapshot = await resolve(path.resolve(directory, input.workdir ?? "."), context);
       await setEnvironment(context.sessionID, snapshot.env, context.signal);
       context.signal?.throwIfAborted();
       // ponytail: serialize foreground calls through completion because the
