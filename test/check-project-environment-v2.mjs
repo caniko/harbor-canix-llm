@@ -17,8 +17,14 @@ const sourceArgs = process.env.OPENCODE_SOURCE ? ["run", "--cwd", path.join(proc
 const root = await mkdtemp(path.join(os.tmpdir(),"project-env-v2-"));
 const a = `${root}/a`, b = `${root}/b`, home = `${root}/home`, probe = `${root}/probe`;
 for (const directory of [a, b, home, probe]) await mkdir(directory);
-const password = randomBytes(24).toString("hex");
+let password = randomBytes(24).toString("hex");
 const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: `${home}/config`, XDG_DATA_HOME: `${home}/data`, XDG_STATE_HOME: `${home}/state`, OPENCODE_PASSWORD: password, PROJECT_TEST_BASE: "backend-value" };
+if (process.env.PROJECT_ENV_NATIVE_CREDENTIAL === "1") {
+  assert.equal(sourceArgs.length, 0, "native credential probe requires a packaged executable");
+  delete env.OPENCODE_PASSWORD;
+  password = (await promisify(execFile)(opencode, ["service", "get", "password"], {env,cwd:a})).stdout.trim();
+  assert.ok(password);
+}
 for (const name of Object.keys(env)) if (name.startsWith("DIRENV_")) delete env[name];
 for (const project of [a, b]) {
   await writeFile(`${project}/flake.nix`, '{ outputs = {self}: { devShells.x86_64-linux = let shell = builtins.derivation {name="fixture-shell";system="x86_64-linux";builder="/bin/sh";}; in {default=shell;docs=shell;}; }; }');
@@ -42,10 +48,10 @@ export default {id:"canix.env-probe", async setup(ctx) {
 }};
 `);
 await writeFile(`${a}/opencode.json`, JSON.stringify({ plugins: [
-  { package: process.env.PROJECT_ENV_PLUGIN ?? fileURLToPath(new URL("../plugins/project-environment-prototype", import.meta.url)), options: {roots:[a,b], direnv, nix, system:"x86_64-linux", serverURL:url, direnvApproval:"manual"} },
+  { package: process.env.PROJECT_ENV_PLUGIN ?? fileURLToPath(new URL("../plugins/project-environment-prototype", import.meta.url)), options: {roots:[a,b], direnv, nix, system:"x86_64-linux", serverURL:url, direnvApproval:"manual", opencode} },
   { package: probe },
 ] }));
-const child = spawn(opencode, [...sourceArgs, "--print-logs", "serve", "--hostname", "127.0.0.1", "--port", new URL(url).port], {cwd:a, env, stdio:["ignore","pipe","pipe"]});
+const child = spawn(opencode, [...sourceArgs, "--print-logs", "serve", ...(process.env.PROJECT_ENV_NATIVE_CREDENTIAL === "1" ? ["--service"] : []), "--hostname", "127.0.0.1", "--port", new URL(url).port], {cwd:a, env, stdio:["ignore","pipe","pipe"]});
 let log = "";
 child.stdout.on("data", chunk => { log += chunk; });
 child.stderr.on("data", chunk => { log += chunk; });

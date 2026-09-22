@@ -3,6 +3,9 @@
 import { createProjectEnvironments, createEnvironmentBarrier } from "./project-environment.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import path from "node:path";
 
 export async function waitForEnvironmentApproval({ request, sessionID, approval, signal }) {
   const endpoint = `/api/session/${encodeURIComponent(sessionID)}/form`;
@@ -45,8 +48,17 @@ export default {
     if (backend.protocol !== "http:" || backend.hostname !== "127.0.0.1" || backend.username || backend.password) {
       throw new Error("Prototype requires an explicitly configured loopback backend");
     }
-    const password = process.env.OPENCODE_PASSWORD;
-    if (!password) throw new Error("Prototype requires the managed backend authentication environment");
+    let password = process.env.OPENCODE_PASSWORD;
+    if (!password && typeof ctx.options.opencode === "string" && path.isAbsolute(ctx.options.opencode)) {
+      // Reuse the backend's native 0600 service credential rather than
+      // embedding it in Nix configuration or passing it to project shells.
+      try {
+        password = (await promisify(execFile)(ctx.options.opencode, ["service", "get", "password"], {
+          timeout: 10_000, maxBuffer: 8192,
+        })).stdout.trim();
+      } catch { throw new Error("Cannot resolve the managed v2 backend credential"); }
+    }
+    if (!password) throw new Error("Prototype requires OPENCODE_PASSWORD or an absolute managed v2 opencode executable");
     const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: process.env, direnvApproval: ctx.options.direnvApproval });
     const request = async (method, endpoint, body, signal) => {
       const response = await fetch(new URL(endpoint, backend), {

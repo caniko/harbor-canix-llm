@@ -81,6 +81,13 @@ uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
 `project-env-clear` (`{"cwd":"/project"}`). Agent-side selection authorization
 is not implemented by this prototype.
 
+For a native `serve --service` backend, set `opencode` to the absolute v2
+executable instead of exporting `OPENCODE_PASSWORD`. The plugin obtains the
+credential with `opencode service get password` under the same isolated XDG
+directories. Native v2 owns the 0600 credential file; neither Nix settings nor
+project environments need to contain the password. This mode is not for a
+foreground `serve` instance with an unrelated ephemeral password.
+
 Resolve, select and clear share one session preparation queue and approval
 flow; a selection is committed only after successful preparation. Cancelling
 a queued caller settles it promptly without cancelling its predecessor, and
