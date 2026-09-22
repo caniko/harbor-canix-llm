@@ -19,7 +19,7 @@ async function writableDirectories(directory) {
   }
 }
 
-async function fixture(t) {
+async function fixture(t, options = { direnvApproval: "manual" }, approved = true) {
   const root = await mkdtemp(path.join(os.tmpdir(), "project-environment-"));
   t.after(async () => { await writableDirectories(root); await rm(root, { recursive: true, force: true }); });
   const baseline = { ...process.env, HOME: `${root}/home`, XDG_CONFIG_HOME: `${root}/config`, XDG_DATA_HOME: `${root}/data`, PROJECT_TEST_BASE: "baseline" };
@@ -39,11 +39,49 @@ unset PROJECT_TEST_BASE
   for (const project of projects) {
     await writeFile(path.join(project, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "fixture-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; docs = shell; notAShell = null; }; }; }`);
     await writeFile(path.join(project, ".envrc"), envrc(path.basename(project)));
-    await exec(direnv, ["allow", project], { env: baseline });
+    if (approved) await exec(direnv, ["allow", project], { env: baseline });
   }
-  const environments = createProjectEnvironments({ roots: projects, direnv, nix, system, baseline });
+  const environments = createProjectEnvironments({ roots: projects, direnv, nix, system, baseline, ...options });
   return { projects, baseline, environments };
 }
+
+test("invalid approval mode fails configuration validation", () => {
+  assert.throws(() => createProjectEnvironments({ direnvApproval: "always" }), /auto or manual/);
+});
+
+test("auto is default and approves only when preparation is requested", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t, {}, false);
+  const allowed = async () => JSON.parse((await exec(direnv, ["status", "--json"], { cwd, env: baseline })).stdout).state.foundRC.allowed;
+  assert.equal(await allowed(), 1);
+  await environments.list(cwd);
+  assert.equal(await allowed(), 1);
+  assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "a:default");
+  assert.equal(await allowed(), 0);
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="edited"\n');
+  assert.equal(await allowed(), 1);
+  assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "edited");
+  assert.equal(await allowed(), 0);
+});
+
+test("auto respects explicit direnv deny", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t, { direnvApproval: "auto" });
+  await exec(direnv, ["deny", cwd], { env: baseline });
+  await assert.rejects(environments.resolve({ sessionID: "a", cwd }), /operator approval/);
+  const status = JSON.parse((await exec(direnv, ["status", "--json"], { cwd, env: baseline })).stdout);
+  assert.equal(status.state.foundRC.allowed, 2);
+});
+
+test("auto approval does not permit execution after failed export", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t, {});
+  await writeFile(path.join(cwd, ".envrc"), "exit 1\n");
+  const execute = wrapProjectCommand({
+    directory: cwd, environments,
+    setEnvironment: async () => assert.fail("must not publish"),
+    execute: async () => assert.fail("must not execute"),
+    requestApproval: async () => assert.fail("auto must not prompt for new content"),
+  });
+  await assert.rejects(execute({}, { sessionID: "a" }), /failed/);
+});
 
 test("approved direnv default, flake selection, clear and tombstones", integration, async (t) => {
   const { projects: [cwd], environments } = await fixture(t);

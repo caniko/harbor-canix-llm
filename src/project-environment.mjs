@@ -31,7 +31,8 @@ const inside = (root, target) => {
 
 // Selection metadata only. Every launch asks direnv to evaluate from the
 // same baseline; nix-direnv owns its build cache and watch invalidation.
-export function createProjectEnvironments({ roots, direnv, nix, system, baseline }) {
+export function createProjectEnvironments({ roots, direnv, nix, system, baseline, direnvApproval = "auto" }) {
+  if (!["auto", "manual"].includes(direnvApproval)) throw new Error("direnvApproval must be auto or manual");
   if (!roots?.length || ![...roots, direnv, nix].every((p) => typeof p === "string" && path.isAbsolute(p))) {
     throw new Error("Project environments require absolute roots and executable paths");
   }
@@ -81,13 +82,22 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
     return { ...project, shells: names };
   }
   async function requireApproval(project, env, signal) {
-    const status = JSON.parse(await run(direnv, ["status", "--json"], project.cwd, env, signal));
-    const rc = status.state?.foundRC;
-    if (!rc || !inside(project.root, await realpath(rc.path))) throw new Error("Project has no local .envrc; configure it explicitly");
-    if (rc.allowed !== 0) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const status = JSON.parse(await run(direnv, ["status", "--json"], project.cwd, env, signal));
+      const rc = status.state?.foundRC;
+      if (!rc || !inside(project.root, await realpath(rc.path))) throw new Error("Project has no local .envrc; configure it explicitly");
+      if (rc.allowed === 0) return;
+      if (![1, 2].includes(rc.allowed)) throw new Error("Unknown direnv approval state");
       const file = await realpath(rc.path);
-      throw new EnvironmentApprovalRequired(project.root, file, await revision(file));
+      const approval = new EnvironmentApprovalRequired(project.root, file, await revision(file));
+      // direnv 2.37: Allowed=0, NotAllowed=1, explicitly Denied=2.
+      if (direnvApproval === "manual" || rc.allowed === 2) throw approval;
+      if (!await approval.isCurrent()) continue;
+      signal?.throwIfAborted();
+      await run(direnv, ["allow", file], project.cwd, env, signal);
+      // Re-read native trust after allow; never export based on an old status.
     }
+    throw new Error("Project .envrc approval did not stabilize; retry preparation");
   }
   async function capture(project, shell, signal) {
     const env = { ...base, ...(shell === undefined ? {} : { PROJECT_DEV_SHELL: shell }) };

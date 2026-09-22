@@ -53,7 +53,7 @@ prototype**, not a replacement for the production adapter. It selects by
 session and canonical flake root, discovers derivation-valued
 `devShells.<system>` attributes, and runs the project's approved `.envrc` from
 a clean, fixed baseline for each command. Selection does not edit project
-files or call `direnv allow`.
+files. Approval follows the operator-configured `direnvApproval` mode.
 
 Owned projects can opt into named selection with an `.envrc` convention:
 
@@ -79,14 +79,24 @@ uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
 `project-env-clear` (`{"cwd":"/project"}`). Agent-side selection authorization
 is not implemented by this prototype.
 
-The command approval barrier is **lazy**: changing `.envrc` alone does not
+`direnvApproval` accepts `"auto"` (the default) or `"manual"`. In auto mode,
+preparing an environment automatically runs native `direnv allow` for a new or
+changed `.envrc` within configured project roots, then rechecks trust before
+exporting it. Explicit `direnv deny` remains blocked in either mode and uses
+the manual approval flow. Native direnv trust is user-wide; shell choices are
+still session-scoped. Command permissions are not bypassed. The same mode
+applies to preparation during select and clear, not catalog listing.
+
+Use `{"direnvApproval":"manual"}` to retain the approval form/retry workflow.
+Invalid modes fail configuration validation. In both modes preparation is
+**lazy**: changing `.envrc` alone does not
 interrupt a session or request approval. Reads/edits remain available and an
 already-running command finishes with its captured environment. The next
 wrapped command that needs an unapproved environment waits on a stock-v2
 session form, before publishing an environment or invoking the executor.
 Queued commands in that session wait behind it; completed work is not replayed.
 
-The form identifies the canonical `.envrc` and its revision. Review and grant
+In manual mode (or after explicit denial), the form identifies the canonical `.envrc` and its revision. Review and grant
 trust using native `direnv allow`, then choose **Approved in direnv — retry**.
 The form does not grant trust itself: every retry checks direnv again. Editing
 while a form is pending cancels the obsolete form and resolves the current
@@ -97,7 +107,7 @@ not a watcher that pauses reasoning or interrupts active jobs.
 
 **Release blocker, reproduced on stock v2 `b8aa08f2`:** direct
 `POST /api/session/:id/shell` bypasses the registered-tool wrapper. After editing
-`.envrc` without reapproval, the wrapped tool refuses execution but that endpoint
+`.envrc` in manual mode without reapproval, the wrapped tool waits but that endpoint
 still runs with its old environment. PTYs and formatter subprocesses are also
 outside this wrapper's coverage. Do not enable it as an all-commands policy.
 

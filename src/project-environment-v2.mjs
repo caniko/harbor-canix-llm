@@ -47,7 +47,7 @@ export default {
     }
     const password = process.env.OPENCODE_PASSWORD;
     if (!password) throw new Error("Prototype requires the managed backend authentication environment");
-    const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: process.env });
+    const environments = createProjectEnvironments({ roots, direnv, nix, system, baseline: process.env, direnvApproval: ctx.options.direnvApproval });
     const request = async (method, endpoint, body, signal) => {
       const response = await fetch(new URL(endpoint, backend), {
         method,
@@ -70,8 +70,8 @@ export default {
         });
       }
     });
-    // Explicit operator slash commands; no automatic direnv allow or config
-    // edits. The prototype does not expose selection as an agent-side tool.
+    // Explicit operator slash commands use the same configured approval mode.
+    // The prototype does not expose selection as an agent-side tool.
     await ctx.command.transform((editor) => {
       editor.add({ name: "project-env-select", execute: async ({ sessionID, prompt }) => {
         const { cwd = ctx.location.directory, shell } = JSON.parse(prompt.text);
