@@ -76,14 +76,31 @@ try {
   assert.equal(result.output.status,"completed",JSON.stringify(result));
   return result.output.output;
  }
- assert.match(await run(one,a,"default"),/a:default\|/);
- await command(one,"project-env-select",{cwd:a,shell:"docs"});
+  assert.match(await run(one,a,"default"),/a:default\|/);
+ async function approveDuring(session, action) {
+   const prior = new Set((await request("GET",`/api/session/${session}/form`)).data.map(item=>item.id));
+   const pending = action().then(value=>({value}),error=>({error}));
+   let approval;
+   for(let i=0;i<100;i++) {
+     approval=(await request("GET",`/api/session/${session}/form`)).data.find(item=>!prior.has(item.id));
+     if(approval) break;
+     await new Promise(resolve=>setTimeout(resolve,50));
+   }
+   assert.ok(approval,"selection operation must request native approval");
+   await promisify(execFile)(direnv,["allow",a],{env});
+   await request("POST",`/api/session/${session}/form/${approval.id}/reply`,{answer:{decision:"retry"}});
+   const result=await pending;
+   if(result.error) throw result.error;
+ }
+ await writeFile(`${a}/.envrc`,(await readFile(`${a}/.envrc`,"utf8"))+"\n# selected revision\n");
+ await approveDuring(one,()=>command(one,"project-env-select",{cwd:a,shell:"docs"}));
  assert.match(await run(one,a,"selected"),/a:docs\|/);
  assert.doesNotMatch(await run(one,a,"removed"),/backend-value/);
  assert.match(await run(two,a,"isolated"),/a:default\|/);
  const [ra,rb] = await Promise.all([run(one,a,"parallel-a"),run(one,b,"parallel-b")]);
  assert.match(ra,/a:docs\|/); assert.match(rb,/b:default\|/);
- await command(one,"project-env-clear",{cwd:a});
+ await writeFile(`${a}/.envrc`,(await readFile(`${a}/.envrc`,"utf8"))+"\n# cleared revision\n");
+ await approveDuring(one,()=>command(one,"project-env-clear",{cwd:a}));
  assert.match(await run(one,a,"clear"),/a:default\|/);
  const finishing = run(one,a,"finishing",`printf started > '${root}/started'; while [ ! -f '${root}/release' ]; do sleep 0.05; done; printf 'finished:%s' "$PROJECT_TEST"`);
  for(let i=0;i<100;i++) {
@@ -102,7 +119,7 @@ try {
  const held = run(one,a,"after-approval");
  let form;
  for(let i=0;i<100;i++) {
-  form=(await request("GET",`/api/session/${one}/form`)).data[0];
+  form=(await request("GET",`/api/session/${one}/form`)).data.find(item=>item.metadata.revision && item.metadata.envrc === `${a}/.envrc`);
   if(form) break;
   await new Promise(resolve=>setTimeout(resolve,50));
  }
@@ -138,6 +155,19 @@ try {
   await assert.rejects(command(denied,"env-probe",{command:`printf denied > '${root}/denied'`,workdir:b,tag:"denied"}));
   await assert.rejects(readFile(`${root}/denied`),{code:"ENOENT"});
   console.log("PASS: native shell denial prevents command side effects");
+  const deleting = await create();
+  await writeFile(`${a}/.envrc`, 'export PROJECT_TEST="deleted-session"\n');
+  const selecting = command(deleting,"project-env-select",{cwd:a,shell:"docs"}).then(()=>({ok:true}),error=>({error}));
+  let deletionForm;
+  for(let i=0;i<100;i++) {
+    deletionForm=(await request("GET",`/api/session/${deleting}/form`)).data[0];
+    if(deletionForm) break;
+    await new Promise(resolve=>setTimeout(resolve,50));
+  }
+  assert.ok(deletionForm,"selection must be waiting before deletion");
+  await request("DELETE",`/api/session/${deleting}`);
+  assert.ok((await selecting).error,"deletion must cancel the pending selection");
+  console.log("PASS: select/clear use native forms; session deletion cancels pending selection");
 } finally {
  child.kill("SIGTERM");
  const timer=setTimeout(()=>child.kill("SIGKILL"),5000);

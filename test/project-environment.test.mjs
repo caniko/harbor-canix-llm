@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createProjectEnvironments, wrapProjectCommand } from "../src/project-environment.mjs";
+import { createProjectEnvironments, createEnvironmentBarrier } from "../src/project-environment.mjs";
 
 const exec = promisify(execFile);
 const direnv = process.env.DIRENV_BIN;
@@ -74,13 +74,11 @@ test("auto respects explicit direnv deny", integration, async (t) => {
 test("auto approval does not permit execution after failed export", integration, async (t) => {
   const { projects: [cwd], environments } = await fixture(t, {});
   await writeFile(path.join(cwd, ".envrc"), "exit 1\n");
-  const execute = wrapProjectCommand({
-    directory: cwd, environments,
-    setEnvironment: async () => assert.fail("must not publish"),
-    execute: async () => assert.fail("must not execute"),
+  const barrier = createEnvironmentBarrier({
+    environments,
     requestApproval: async () => assert.fail("auto must not prompt for new content"),
   });
-  await assert.rejects(execute({}, { sessionID: "a" }), /failed/);
+  await assert.rejects(barrier.resolve({ cwd, sessionID: "a" }), /failed/);
 });
 
 test("approved direnv default, flake selection, clear and tombstones", integration, async (t) => {
@@ -134,25 +132,17 @@ test("unacknowledged selection and stale nix-direnv fallback are rejected", inte
   await assert.rejects(environments.resolve({ sessionID: "a", cwd }), /stale fallback/);
 });
 
-test("two projects in one session are serialized through delegated execution", integration, async (t) => {
+test("two projects in one session get independent immutable snapshots", integration, async (t) => {
   const { projects: [a, b], environments } = await fixture(t);
-  const active = new Map();
-  const seen = [];
-  const execute = wrapProjectCommand({
-    directory: a, environments,
-    setEnvironment: async (session, env) => { active.set(session, env); },
-    execute: async (input, context) => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      seen.push(active.get(context.sessionID).PROJECT_TEST);
-      return input.command;
-    },
-  });
+  const barrier = createEnvironmentBarrier({ environments });
   const context = { sessionID: "one", signal: new AbortController().signal };
-  assert.deepEqual(await Promise.all([
-    execute({ command: "a", workdir: a }, context),
-    execute({ command: "b", workdir: b }, context),
-  ]), ["a", "b"]);
-  assert.deepEqual(seen, ["a:default", "b:default"]);
+  const [first, second] = await Promise.all([
+    barrier.resolve({ cwd: a, ...context }),
+    barrier.resolve({ cwd: b, ...context }),
+  ]);
+  assert.equal(first.env.PROJECT_TEST, "a:default");
+  assert.equal(second.env.PROJECT_TEST, "b:default");
+  assert.ok(Object.isFrozen(first.env));
 });
 
 test("edits are lazy; current execution finishes and queued work waits for direnv approval", integration, async (t) => {
@@ -164,15 +154,16 @@ test("edits are lazy; current execution finishes and queued work waits for diren
   const decision = new Promise((resolve) => { answer = resolve; });
   let prompts = 0;
   const executed = [];
-  const execute = wrapProjectCommand({
-    directory: cwd, environments, setEnvironment: async () => {},
+  const barrier = createEnvironmentBarrier({
+    environments,
     requestApproval: async ({ approval }) => { prompts++; asked(approval); return decision; },
-    execute: async (input) => {
+  });
+  const execute = async (input, context) => {
+      await barrier.resolve({ cwd, ...context });
       executed.push(input.command);
       if (input.command === "running") { started(); await release; }
       return input.command;
-    },
-  });
+  };
   const context = { sessionID: "one", signal: new AbortController().signal };
   const first = execute({ command: "running" }, context);
   await running;
@@ -200,15 +191,13 @@ test("declined revision is not repeatedly prompted or executed", integration, as
   const { projects: [cwd], environments } = await fixture(t);
   await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="changed"\n');
   let prompts = 0;
-  const execute = wrapProjectCommand({
-    directory: cwd, environments,
-    setEnvironment: async () => assert.fail("must not publish an environment"),
-    execute: async () => assert.fail("must not execute"),
+  const barrier = createEnvironmentBarrier({
+    environments,
     requestApproval: async () => { prompts++; return "deny"; },
   });
   const context = { sessionID: "one", signal: new AbortController().signal };
-  await assert.rejects(execute({}, context), /declined/);
-  await assert.rejects(execute({}, context), /declined/);
+  await assert.rejects(barrier.resolve({ cwd, ...context }), /declined/);
+  await assert.rejects(barrier.resolve({ cwd, ...context }), /declined/);
   assert.equal(prompts, 1);
 });
 
@@ -217,10 +206,8 @@ test("retry alone grants no trust; editing invalidates the displayed revision", 
   await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="first"\n');
   let prompts = 0;
   let previous;
-  const execute = wrapProjectCommand({
-    directory: cwd, environments,
-    setEnvironment: async () => assert.fail("must not publish an environment"),
-    execute: async () => assert.fail("must not execute"),
+  const barrier = createEnvironmentBarrier({
+    environments,
     requestApproval: async ({ approval }) => {
       prompts++;
       if (prompts === 1) {
@@ -233,6 +220,57 @@ test("retry alone grants no trust; editing invalidates the displayed revision", 
       return "deny";
     },
   });
-  await assert.rejects(execute({}, { sessionID: "one" }), /declined/);
+  await assert.rejects(barrier.resolve({ cwd, sessionID: "one" }), /declined/);
   assert.equal(prompts, 2);
+});
+
+test("select and clear use the same manual approval barrier as resolve", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t, { direnvApproval: "manual" }, false);
+  let prompts = 0;
+  const barrier = createEnvironmentBarrier({ environments, requestApproval: async () => {
+    prompts++;
+    await exec(direnv, ["allow", cwd], { env: baseline });
+    return "retry";
+  } });
+  t.after(() => barrier.dispose());
+  await barrier.select({ sessionID: "a", cwd, shell: "docs" });
+  assert.equal(prompts, 1);
+  assert.equal((await barrier.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "a:docs");
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="new-default"\n');
+  await barrier.clear({ sessionID: "a", cwd });
+  assert.equal(prompts, 2);
+  assert.equal((await barrier.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "new-default");
+});
+
+test("session move resets selection; deletion and unload reject future preparation", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  const barrier = createEnvironmentBarrier({ environments });
+  await barrier.select({ sessionID: "a", cwd, shell: "docs" });
+  await barrier.reset("a");
+  assert.equal((await barrier.resolve({ sessionID: "a", cwd })).shell, null);
+  await barrier.release("a");
+  await assert.rejects(barrier.resolve({ sessionID: "a", cwd }), /unavailable/);
+  await barrier.dispose();
+  await assert.rejects(barrier.resolve({ sessionID: "b", cwd }), /unavailable/);
+});
+
+test("cancelling queued preparation settles before its predecessor without running later", { timeout: 3000 }, async () => {
+  const entered = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  const calls = [];
+  const barrier = createEnvironmentBarrier({ environments: {
+    resolve: async ({ cwd }) => { calls.push(cwd); entered.resolve(); await finish.promise; return cwd; },
+    release: () => {},
+  } });
+  const first = barrier.resolve({ sessionID: "a", cwd: "first" });
+  await entered.promise;
+  const controller = new AbortController();
+  const rejected = assert.rejects(barrier.resolve({ sessionID: "a", cwd: "cancelled", signal: controller.signal }), { name: "AbortError" });
+  controller.abort();
+  await rejected;
+  assert.deepEqual(calls, ["first"]);
+  finish.resolve();
+  assert.equal(await first, "first");
+  await barrier.dispose();
+  assert.deepEqual(calls, ["first"]);
 });

@@ -136,6 +136,7 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
       if (!project.shells.includes(shell)) throw new Error("Shell is not declared by the project flake");
       const id = key(sessionID, project.root);
       await capture(project, shell, signal);
+      signal?.throwIfAborted();
       selections.set(id, shell);
       return { root: project.root, shell };
     },
@@ -143,72 +144,84 @@ export function createProjectEnvironments({ roots, direnv, nix, system, baseline
       const project = await projectAt(cwd);
       const id = key(sessionID, project.root);
       await capture(project, undefined, signal);
+      signal?.throwIfAborted();
       selections.delete(id);
       return { root: project.root, shell: null };
+    },
+    release(sessionID) {
+      for (const id of selections.keys()) if (JSON.parse(id)[0] === sessionID) selections.delete(id);
     },
   };
 }
 
 // Reusable preparation barrier; native hooks consume its immutable snapshot.
 export function createEnvironmentBarrier({ environments, requestApproval }) {
-  const denied = new Set();
-  const preparing = new Map();
-  const resolve = async (cwd, context) => {
-      context.signal?.throwIfAborted();
-      let snapshot;
+  const sessions = new Map();
+  const released = new Set();
+  let disposed = false;
+
+  async function prepare(operation, input) {
+    const { sessionID } = input;
+    if (!sessionID || disposed || released.has(sessionID)) throw new Error("Project environment session is unavailable");
+    let state = sessions.get(sessionID);
+    if (!state) {
+      state = { controller: new AbortController(), denied: new Set(), tail: Promise.resolve() };
+      sessions.set(sessionID, state);
+    }
+    const signal = AbortSignal.any([state.controller.signal, ...(input.signal ? [input.signal] : [])]);
+    signal.throwIfAborted();
+    const work = state.tail.catch(() => {}).then(async () => {
       for (;;) {
-        context.signal?.throwIfAborted();
+        signal.throwIfAborted();
         try {
-          snapshot = await environments.resolve({ sessionID: context.sessionID, cwd, signal: context.signal });
-          break;
+          const result = await environments[operation]({ ...input, signal });
+          signal.throwIfAborted();
+          return result;
         } catch (error) {
           if (!(error instanceof EnvironmentApprovalRequired) || !requestApproval) throw error;
-          const id = JSON.stringify([context.sessionID, error.envrc, error.revision]);
-          if (denied.has(id)) throw new Error(`Project environment approval was declined: ${error.envrc}`);
+          const id = JSON.stringify([error.envrc, error.revision]);
+          if (state.denied.has(id)) throw new Error(`Project environment approval was declined: ${error.envrc}`);
           if (!await error.isCurrent()) continue;
-          const answer = await requestApproval({ sessionID: context.sessionID, approval: error, signal: context.signal });
-          context.signal?.throwIfAborted();
+          const answer = await requestApproval({ sessionID, approval: error, signal });
+          signal.throwIfAborted();
           if (answer === "deny") {
-            denied.add(id);
+            state.denied.add(id);
             throw new Error(`Project environment approval was declined: ${error.envrc}`);
           }
           if (answer !== "retry") throw new Error("Invalid project environment approval response");
-          // A form answer is not direnv approval. Resolve again and require
-          // the native trust state for the current file before executing.
         }
       }
-      context.signal?.throwIfAborted();
-      return snapshot;
-  };
-  return async (cwd, context) => {
-    // Serialize preparation only: one pending approval per session, but a
-    // running command never holds this queue or mutates another's snapshot.
-    const previous = preparing.get(context.sessionID) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(() => resolve(cwd, context));
-    preparing.set(context.sessionID, next);
-    try { return await next; }
-    finally { if (preparing.get(context.sessionID) === next) preparing.delete(context.sessionID); }
-  };
-}
-
-// Retained only for the old-wrapper regression tests. The native hook plugin
-// above no longer swaps a session-global environment or serializes execution.
-export function wrapProjectCommand({ execute, environments, setEnvironment, directory, requestApproval }) {
-  const pending = new Map();
-  const resolve = createEnvironmentBarrier({ environments, requestApproval });
-  return async (input, context) => {
-    const previous = pending.get(context.sessionID) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(async () => {
-      const snapshot = await resolve(path.resolve(directory, input.workdir ?? "."), context);
-      await setEnvironment(context.sessionID, snapshot.env, context.signal);
-      context.signal?.throwIfAborted();
-      // ponytail: serialize foreground calls through completion because the
-      // public executor has no atomic spawn-with-env API. Per-invocation
-      // native environments are the upgrade path for concurrent execution.
-      return execute(input, context);
     });
-    pending.set(context.sessionID, next);
-    try { return await next; }
-    finally { if (pending.get(context.sessionID) === next) pending.delete(context.sessionID); }
+    state.tail = work;
+    // Keep queue ownership until work finishes, while a cancelled queued
+    // caller settles promptly and never starts after its predecessor finishes.
+    let abort;
+    try {
+      return await Promise.race([work, new Promise((_, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      })]);
+    } finally { signal.removeEventListener("abort", abort); }
+  }
+
+  const reset = (sessionID) => {
+    const state = sessions.get(sessionID);
+    state?.controller.abort();
+    sessions.delete(sessionID);
+    environments.release(sessionID);
+    return state?.tail.catch(() => {});
+  };
+  return {
+    resolve: (input) => prepare("resolve", input),
+    select: (input) => prepare("select", input),
+    clear: (input) => prepare("clear", input),
+    reset,
+    release: (sessionID) => { released.add(sessionID); return reset(sessionID); },
+    async dispose() {
+      disposed = true;
+      await Promise.all([...sessions.keys()].map(reset));
+      released.clear();
+    },
   };
 }

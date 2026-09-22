@@ -81,6 +81,16 @@ uses the managed backend's `OPENCODE_PASSWORD`. Operator slash commands are
 `project-env-clear` (`{"cwd":"/project"}`). Agent-side selection authorization
 is not implemented by this prototype.
 
+Resolve, select and clear share one session preparation queue and approval
+flow; a selection is committed only after successful preparation. Cancelling
+a queued caller settles it promptly without cancelling its predecessor, and
+the cancelled operation never starts later. Session deletion cancels preparation
+and releases choices. A session move or plugin reload resets choices to project
+defaults; environment snapshots and choices are not persisted. Plugin unload
+aborts preparation and closes its lifecycle subscription. Running commands keep
+their already-captured snapshots. This does not yet share selection with the
+separate Pkl MCP process.
+
 `direnvApproval` accepts `"auto"` (the default) or `"manual"`. In auto mode,
 preparing an environment automatically runs native `direnv allow` for a new or
 changed `.envrc` within configured project roots, then rechecks trust before
@@ -108,11 +118,17 @@ cancellation removes its pending form. This implements an execution barrier,
 not a watcher that pauses reasoning or interrupts active jobs.
 
 **Upstream dependency:** proposal `e11f63b2f743dc37da7621408a5b5486e2a9b2b4`
-on [shell-hook-context](https://github.com/caniko/opencode/tree/shell-hook-context),
+in [draft upstream PR #50644](https://github.com/anomalyco/opencode/pull/50644),
 based on upstream `b8aa08f260130452dc87fbc20c2a4e2ff743e642`. It exposes validated
 session identity and cancellation in both Promise and Effect shell APIs. Native
 tests cover direct-user-shell identity and interruption before spawn. It is a
 contribution branch, **not an upstream merge or a production dependency**.
+
+The hook signal covers preparation and is aborted on hook completion or caller
+interruption; it is not a child-process lifetime signal. Native command
+authorization runs after this preparation hook. The configured direnv mode
+authorizes environment preparation separately: a later-denied shell command
+may have caused `.envrc` evaluation, but the command itself must not execute.
 
 The old registered-tool wrapper's direct-shell bypass is closed in that modified
 candidate: both paths now wait at the same hook, and native command denial still

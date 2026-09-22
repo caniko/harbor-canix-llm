@@ -10,15 +10,26 @@ test("native integration registers a shell hook and rejects unsupported executio
     else process.env.OPENCODE_PASSWORD = before;
   });
   let prepare;
-  await plugin.setup({
+  const deleted = Promise.withResolvers();
+  const dispose = await plugin.setup({
     options: { roots: ["/fixture"], direnv: "/fixture/direnv", nix: "/fixture/nix", system: "x86_64-linux", serverURL: "http://127.0.0.1:1" },
     location: { directory: "/fixture" },
     shell: { hook: async (name, callback) => { assert.equal(name, "create.before"); prepare = callback; } },
     command: { transform: async () => {} },
+    event: { async *subscribe({ signal }) {
+      yield { type: "session.deleted", data: { sessionID: "ses_deleted" } };
+      deleted.resolve();
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    } },
     // No tool-transform domain: the plugin must not wrap the native tool.
   });
+  t.after(dispose);
+  await deleted.promise;
+  await assert.rejects(prepare({ sessionID: "ses_deleted", cwd: "/fixture", env: {}, signal: new AbortController().signal }), /unavailable/);
   await assert.rejects(prepare({ cwd: "/fixture", env: {} }), /session-aware native shell hook/);
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(prepare({ sessionID: "ses_test", cwd: "/fixture", env: {}, signal: controller.signal }), { name: "AbortError" });
+  await dispose();
+  await assert.rejects(prepare({ sessionID: "ses_new", cwd: "/fixture", env: {}, signal: new AbortController().signal }), /unavailable/);
 });

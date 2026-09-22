@@ -58,7 +58,7 @@ export default {
       if (!response.ok) throw new Error(`Project environment API request failed (${response.status})`);
       return response.status === 204 ? undefined : response.json();
     };
-    const resolve = createEnvironmentBarrier({
+    const barrier = createEnvironmentBarrier({
       environments,
       requestApproval: (input) => waitForEnvironmentApproval({ ...input, request }),
     });
@@ -68,7 +68,7 @@ export default {
       if (!invocation.sessionID || !invocation.signal) {
         throw new Error("Project environments require the session-aware native shell hook API");
       }
-      const snapshot = await resolve(invocation.cwd, invocation);
+      const snapshot = await barrier.resolve(invocation);
       invocation.env = { ...snapshot.env, TERM: invocation.env.TERM, OPENCODE_TERMINAL: "1" };
     });
     // Explicit operator slash commands use the same configured approval mode.
@@ -76,12 +76,30 @@ export default {
     await ctx.command.transform((editor) => {
       editor.add({ name: "project-env-select", execute: async ({ sessionID, prompt }) => {
         const { cwd = ctx.location.directory, shell } = JSON.parse(prompt.text);
-        await environments.select({ sessionID, cwd, shell });
+        await barrier.select({ sessionID, cwd, shell });
       } });
       editor.add({ name: "project-env-clear", execute: async ({ sessionID, prompt }) => {
         const { cwd = ctx.location.directory } = prompt.text ? JSON.parse(prompt.text) : {};
-        await environments.clear({ sessionID, cwd });
+        await barrier.clear({ sessionID, cwd });
       } });
     });
+    const lifetime = new AbortController();
+    const events = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: lifetime.signal })) {
+        if (event.type === "session.deleted") await barrier.release(event.data.sessionID);
+        if (event.type === "session.moved") await barrier.reset(event.data.sessionID);
+      }
+    })().catch(async () => {
+      if (!lifetime.signal.aborted) {
+        console.error("Project environment lifecycle stream failed; preparation disabled until plugin reload");
+      }
+    }).finally(async () => {
+      if (!lifetime.signal.aborted) await barrier.dispose();
+    });
+    return async () => {
+      lifetime.abort();
+      await barrier.dispose();
+      await events;
+    };
   },
 };
