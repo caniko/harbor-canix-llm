@@ -46,6 +46,30 @@ remains pinned. There is no implicit "trust all future shell revisions" mode.
 
 ## Home Manager
 
+### OpenCode v2 Pkl canary
+
+The v1 environment adapter below is not the v2 entrypoint. For stock v2,
+configure the packaged **directory** `lib/harbor-canix-llm/plugins/pkl` as
+a plugin, with `node`, `executable`, and `roots` options containing absolute
+operator-supplied paths. The plugin registers a local stdio MCP server through
+`ctx.mcp.transform`; it does not register direct custom tools or patch OpenCode.
+
+The native v2 MCP executor owns tool approval. Calls supply session identity
+through `ai.opencode/sessionID` metadata, not model arguments. Missing metadata
+is rejected. The implementation provides `pkl_hover`, `pkl_diagnostics`, and
+`pkl_status` for saved files within configured roots. Roots bound direct file
+access; they are not an OS sandbox or a guarantee about Pkl imports. Approval
+authorizes the Pkl operation, not a promise to enforce every native read rule.
+
+This is a canary integration: Harbor-selected environments and session-deletion
+cleanup are not yet wired into the MCP process. It currently uses its baseline
+environment and releases servers when the MCP connection closes. Do not replace
+the production v1 environment adapter with this entrypoint.
+
+Run `canix cache build .#checks.x86_64-linux.environments` to execute the tests
+with packaged dependencies and the real pinned Pkl server. Direct local tests
+also support `PKL_LSP_BIN=/absolute/path/pkl-lsp node --test test/*.test.mjs`.
+
 After publishing and locking this flake, import
 `inputs.harbor-canix-llm.homeManagerModules.default`. Minimal consumer:
 

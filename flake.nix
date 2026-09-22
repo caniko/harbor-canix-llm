@@ -39,7 +39,7 @@
         npmDeps = pkgs.importNpmLock {npmRoot = ./.;};
         installPhase = ''
           mkdir -p $out/lib/harbor-canix-llm
-          cp -r src node_modules package.json $out/lib/harbor-canix-llm/
+          cp -r src plugins node_modules package.json $out/lib/harbor-canix-llm/
         '';
       };
     });
