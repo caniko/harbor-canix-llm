@@ -40,6 +40,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
   if (!executable) throw new Error("pkl server executable is required");
   const servers = new Map();
   const chains = new Map();
+  const lifetime = new AbortController();
   let disposed = false;
 
   function key(sessionID, root) {
@@ -52,8 +53,8 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
   }
 
   async function exited(child) {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise((resolve) => child.once("exit", resolve));
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+    await new Promise((resolve) => child.once("close", resolve));
   }
 
   // Bounded wait that always clears its timer.
@@ -89,16 +90,18 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     await exited(entry.child);
   }
 
-  async function start(root, env) {
+  async function start(root, env, signal) {
+    if (signal.aborted) throw abortError();
     const child = spawn(executable, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
     const entry = {
       child, connection: null, env, documents: new Map(),
       stopped: false, dead: false, pid: child.pid, stderrText: "",
     };
-    const fail = (cause) => {
+    const fail = async (cause) => {
       entry.stopped = true;
       try { child.kill("SIGKILL"); } catch {}
       try { entry.connection?.dispose(); } catch {}
+      await exited(child);
       throw cause;
     };
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
@@ -134,12 +137,13 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
         }),
         "initialize",
         timeoutMs,
+        signal,
       );
       connection.sendNotification("initialized", {});
       entry.hoverProvider = capabilities?.capabilities?.hoverProvider ?? capabilities?.hoverProvider;
       return entry;
     } catch (error) {
-      fail(error);
+      return await fail(error);
     }
   }
 
@@ -153,7 +157,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     return next;
   }
 
-  async function serverFor(id, sessionID, root, env, generation) {
+  async function serverFor(id, sessionID, root, env, generation, signal) {
     if (disposed) throw new Error("pkl servers are disposed");
     const current = servers.get(id);
     if (current && alive(current) && current.generation === generation) return current;
@@ -161,7 +165,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
       servers.delete(id);
       await stop(current).catch(() => {});
     }
-    const entry = await start(root, env);
+    const entry = await start(root, env, signal);
     entry.generation = generation;
     if (disposed) {
       await stop(entry).catch(() => {});
@@ -171,17 +175,17 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     return entry;
   }
 
-  async function open(entry, uri, file) {
+  async function open(entry, uri, file, signal) {
     const known = entry.documents.get(uri);
-    const text = await readFile(file, "utf8");
+    const text = await readFile(file, { encoding: "utf8", signal });
     if (known && known.text === text) return known;
     const version = (known?.version ?? 0) + 1;
     if (!known) {
-      entry.connection.sendNotification("textDocument/didOpen", {
+      await entry.connection.sendNotification("textDocument/didOpen", {
         textDocument: { uri, languageId: "pkl", version, text },
       });
     } else {
-      entry.connection.sendNotification("textDocument/didChange", {
+      await entry.connection.sendNotification("textDocument/didChange", {
         textDocument: { uri, version },
         contentChanges: [{ text }],
       });
@@ -215,11 +219,15 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
     let timer;
     let onAbort;
     const deadline = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`pkl-lsp request ${method} timed out`)), timeout);
-      timer.unref?.();
+      timer = setTimeout(() => {
+        const error = new Error(`pkl-lsp request ${method} timed out`);
+        error.code = "timeout";
+        reject(error);
+      }, timeout);
       if (signal) {
         onAbort = () => reject(abortError());
         signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
       }
     });
     const cleanup = () => {
@@ -239,11 +247,17 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
   }
 
   async function operateOn(sessionID, root, file, resolveEnvironment, signal, action) {
+    signal = AbortSignal.any([lifetime.signal, ...(signal ? [signal] : [])]);
+    if (signal.aborted) throw abortError();
     const { root: realRoot, file: realFile, uri } = await canonicalUnder(root, file);
     const id = key(sessionID, realRoot);
     return operate(id, async () => {
       if (signal?.aborted) throw abortError();
-      const resolved = await resolveEnvironment({ sessionID, root: realRoot, signal });
+      const resolved = await withTimeout(
+        Promise.resolve().then(() => resolveEnvironment({ sessionID, root: realRoot, signal })),
+        "environment resolution", timeoutMs, signal,
+      );
+      if (signal.aborted) throw abortError();
       if (!resolved || typeof resolved.env !== "object" || typeof resolved.generation !== "string") {
         throw new Error("pkl environment resolution must return { env, generation }");
       }
@@ -252,11 +266,22 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
         if (typeof value === "string") env[name] = value;
       }
       const attempt = async (retried) => {
-        const entry = await serverFor(id, sessionID, realRoot, env, resolved.generation);
-        await open(entry, uri, realFile);
+        const entry = await serverFor(id, sessionID, realRoot, env, resolved.generation, signal);
         try {
-          return await action(entry, uri);
+          await open(entry, uri, realFile, signal);
+          if (signal.aborted) throw abortError();
+          return await action(entry, uri, signal);
         } catch (error) {
+          // ponytail: operations serialize per session/root, so retiring this
+          // client clears pending RPCs without interrupting another request.
+          if (signal.aborted || error?.code === "timeout" || error?.code === "cancelled") {
+            servers.delete(id);
+            entry.connection.dispose();
+            entry.child.kill("SIGKILL");
+            await exited(entry.child);
+            if (signal.aborted) throw abortError();
+            throw error;
+          }
           // The server can die between the liveness check and the request
           // (external crash); replace it and retry exactly once.
           if (retried || alive(entry) || !/disposed|is not running|exited/i.test(String(error?.message))) throw error;
@@ -271,7 +296,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
   return {
     async hover({ sessionID, root, file, line, character, resolveEnvironment, signal, timeout = timeoutMs }) {
       const token = tokenFor(signal);
-      return operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri) => {
+      return operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri, operationSignal) => {
         if (!entry.hoverProvider) return { state: "unsupported" };
         const contents = await withTimeout(
           sendRequest(entry.connection, "textDocument/hover", {
@@ -280,7 +305,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
           }, token),
           "textDocument/hover",
           timeout ?? timeoutMs,
-          signal,
+          operationSignal,
         );
         return { state: "ok", hover: contents ?? null, pid: entry.pid, generation: entry.generation };
       });
@@ -288,18 +313,19 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
 
     async diagnostics({ sessionID, root, file, resolveEnvironment, signal, timeout = timeoutMs }) {
       const token = tokenFor(signal);
-      return operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri) => {
+      try {
+        return await operateOn(sessionID, root, file, resolveEnvironment, signal, async (entry, uri, operationSignal) => {
         let result;
         try {
           result = await withTimeout(
             sendRequest(entry.connection, "textDocument/diagnostic", { textDocument: { uri } }, token),
             "textDocument/diagnostic",
             timeout ?? timeoutMs,
-            signal,
+            operationSignal,
           );
         } catch (error) {
           if (error?.code === "cancelled") throw error;
-          if (/timed out/.test(error.message)) return { state: "timeout" };
+          if (error?.code === "timeout") throw error;
           if (/Method not found/i.test(String(error?.message))) return { state: "unsupported" };
           throw error;
         }
@@ -307,7 +333,11 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
           throw new Error(`pkl-lsp returned a malformed diagnostic report`);
         }
         return { state: "ok", diagnostics: result.items, pid: entry.pid, generation: entry.generation };
-      });
+        });
+      } catch (error) {
+        if (error?.code === "timeout") return { state: "timeout" };
+        throw error;
+      }
     },
 
     async status({ sessionID, root }) {
@@ -319,6 +349,7 @@ export function createPklServers({ executable, args = [], timeoutMs = 30_000, st
 
     async dispose() {
       disposed = true;
+      lifetime.abort();
       await Promise.all([...chains.values()].map((pending) => pending.catch(() => {})));
       const entries = [...servers.values()];
       servers.clear();
