@@ -26,6 +26,11 @@ if (process.env.PROJECT_ENV_NATIVE_CREDENTIAL === "1") {
   assert.ok(password);
 }
 for (const name of Object.keys(env)) if (name.startsWith("DIRENV_")) delete env[name];
+// An ambient canary/opencode environment must not inject a second configured
+// plugin instance (its own OPENCODE_CONFIG, credentials or terminal flags).
+for (const name of Object.keys(env)) {
+  if (name.startsWith("OPENCODE_") && name !== "OPENCODE_PASSWORD") delete env[name];
+}
 for (const project of [a, b]) {
   await writeFile(`${project}/flake.nix`, '{ outputs = {self}: { devShells.x86_64-linux = let shell = builtins.derivation {name="fixture-shell";system="x86_64-linux";builder="/bin/sh";}; in {default=shell;docs=shell;}; }; }');
   await writeFile(`${project}/.envrc`, `export PROJECT_TEST="${path.basename(project)}:\${PROJECT_DEV_SHELL:-default}"\nexport PROJECT_DEV_SHELL_ACTIVE="\${PROJECT_DEV_SHELL:-default}"\nunset PROJECT_TEST_BASE\n`);
@@ -83,6 +88,14 @@ try {
   return result.output.output;
  }
   assert.match(await run(one,a,"default"),/a:default\|/);
+  // A nested flake without its own .envrc inherits the in-scope ancestor, and
+  // an uncovered workdir keeps the baseline: neither fails the command.
+  await mkdir(`${a}/nested`);
+  await writeFile(`${a}/nested/flake.nix`, '{ outputs = {self}: { devShells.x86_64-linux = let shell = builtins.derivation {name="nested-shell";system="x86_64-linux";builder="/bin/sh";}; in {default=shell;}; }; }');
+  assert.match(await run(one,`${a}/nested`,"nested"),/a:default\|/);
+  assert.match(await run(one,probe,"uncovered"),/^\|backend-value/);
+  assert.match(await run(one,a,"recovers"),/a:default\|/);
+  console.log("PASS: nested flake and uncovered workdir resolve without failing the command");
  async function approveDuring(session, action) {
    const prior = new Set((await request("GET",`/api/session/${session}/form`)).data.map(item=>item.id));
    const pending = action().then(value=>({value}),error=>({error}));

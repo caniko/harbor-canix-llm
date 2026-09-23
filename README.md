@@ -69,6 +69,20 @@ missing choices and nix-direnv stale fallbacks reject the operation. Commands
 capture the environment for their launch directory; a later `cd` does not
 change it. Non-flake projects can use approved direnv but have no shell menu.
 
+Coverage decides which environment applies, never whether a command may run.
+A launch outside `roots`, or one whose discovered `.envrc` lies beyond the
+configured boundary, uses the configured baseline without executing or
+approving any `.envrc`, and reports `fallback` instead of failing. Inside the
+boundary an ancestor `.envrc` applies to ordinary launches in nested
+directories — including nested flakes that carry no `.envrc` of their own —
+while the shell catalog comes from the nearest `flake.nix`. Explicit selection
+never falls back and never inherits: it fails when the workdir is outside
+`roots`, when no in-scope `.envrc` exists, and when the applicable `.envrc`
+lives outside the selected flake root (an ancestor `.envrc` cannot acknowledge
+another flake's shell name on its behalf). A rejected selection is not
+recorded, and a previously selected project whose local `.envrc` is removed
+rejects instead of silently redirecting to its ancestor.
+
 The prototype now uses a **proposed upstream shell hook API** with native
 `sessionID` and a preparation `AbortSignal`. It sets the invocation's environment
 directly: no session-global environment swapping, no shell-tool replacement,

@@ -102,6 +102,11 @@ export default {
       }
       const snapshot = await barrier.resolve(invocation);
       invocation.env = { ...snapshot.env, TERM: invocation.env.TERM, OPENCODE_TERMINAL: "1" };
+      // Coverage is reported so an operator can see why a workdir kept the
+      // baseline instead of suspecting a stale or broken project environment.
+      if (snapshot.fallback) {
+        console.info("project-environment", JSON.stringify({ status: "baseline", cwd: invocation.cwd, reason: snapshot.fallback }));
+      }
     });
     await ctx.tool.transform((editor) => {
       for (const tool of editor.list()) {

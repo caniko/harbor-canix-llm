@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -183,6 +183,156 @@ test("non-flake projects retain direnv without invented shell choices", integrat
   await rm(path.join(cwd, "flake.nix"));
   assert.deepEqual((await environments.list(cwd)).shells, []);
   assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "a:default");
+});
+
+test("nested flake keeps its own shell catalog while the ancestor .envrc supplies the environment", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  const system = process.arch === "arm64" ? "aarch64-linux" : "x86_64-linux";
+  const nested = path.join(cwd, "nested");
+  await mkdir(nested);
+  // A nested flake without its own .envrc used to fail every launch because
+  // the flake boundary and the discovered .envrc boundary disagreed.
+  await writeFile(path.join(nested, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "nested-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; }; }; }`);
+  const resolved = await environments.resolve({ sessionID: "a", cwd: nested });
+  assert.equal(resolved.env.PROJECT_TEST, "a:default");
+  assert.equal(resolved.env.PROJECT_TEST_BASE, undefined);
+  assert.equal(resolved.fallback, null);
+  assert.equal(resolved.covered, true);
+  assert.equal(resolved.root, nested, "the catalog stays with the nearest flake");
+  assert.equal(resolved.boundary, await realpath(cwd), "the environment scope is the configured root");
+  assert.deepEqual((await environments.list(nested)).shells, ["default"]);
+  assert.deepEqual((await environments.list(cwd)).shells, ["default", "docs"]);
+});
+
+test("workdirs outside the configured roots keep the baseline and never run a foreign .envrc", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t);
+  const outside = path.join(path.dirname(cwd), "outside");
+  await mkdir(outside);
+  // Allowed on purpose: a wrong implementation would execute it and show up
+  // both as this marker and as PROJECT_TEST leaking into the launch.
+  await writeFile(path.join(outside, ".envrc"), `echo executed > ${JSON.stringify(path.join(outside, "executed"))}\nexport PROJECT_TEST="outside"\nexport PROJECT_TEST_BASE="outside"\n`);
+  await exec(direnv, ["allow", outside], { env: baseline });
+  assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "a:default");
+  const resolved = await environments.resolve({ sessionID: "a", cwd: outside });
+  assert.equal(resolved.covered, false);
+  assert.equal(resolved.fallback, "outside configured project roots");
+  assert.equal(resolved.env.PROJECT_TEST, undefined);
+  assert.equal(resolved.env.PROJECT_TEST_BASE, "baseline");
+  assert.ok(Object.isFrozen(resolved.env));
+  await assert.rejects(readFile(path.join(outside, "executed")), { code: "ENOENT" }, "an uncovered .envrc never executes");
+  assert.equal((await environments.resolve({ sessionID: "a", cwd })).env.PROJECT_TEST, "a:default", "the covered launch is unaffected");
+  await environments.clear({ sessionID: "a", cwd: outside });
+});
+
+test("an ancestor .envrc outside the configured boundary is discovered but not executed", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t);
+  const parent = path.dirname(cwd);
+  await writeFile(path.join(parent, ".envrc"), `echo executed > ${JSON.stringify(path.join(parent, "executed"))}\nexport PROJECT_TEST="ancestor"\nexport PROJECT_TEST_BASE="ancestor"\n`);
+  await exec(direnv, ["allow", parent], { env: baseline });
+  await rm(path.join(cwd, ".envrc"));
+  const resolved = await environments.resolve({ sessionID: "a", cwd });
+  assert.equal(resolved.covered, true, "the workdir itself is inside a configured root");
+  assert.equal(resolved.fallback, "no in-scope project .envrc");
+  assert.equal(resolved.env.PROJECT_TEST, undefined);
+  assert.equal(resolved.env.PROJECT_TEST_BASE, "baseline");
+  await assert.rejects(readFile(path.join(parent, "executed")), { code: "ENOENT" }, "an out-of-scope ancestor never executes");
+  const status = JSON.parse((await exec(direnv, ["status", "--json"], { cwd, env: baseline })).stdout);
+  assert.equal(status.state.foundRC.path, path.join(parent, ".envrc"));
+});
+
+test("explicit shell selection never silently falls back to the baseline", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  const outside = path.join(path.dirname(cwd), "outside");
+  await mkdir(outside);
+  await assert.rejects(environments.select({ sessionID: "a", cwd: outside, shell: "docs" }), /outside configured project roots/);
+  await rm(path.join(cwd, ".envrc"));
+  await assert.rejects(environments.select({ sessionID: "a", cwd, shell: "docs" }), /project \.envrc inside the configured roots/);
+  const resolved = await environments.resolve({ sessionID: "a", cwd });
+  assert.equal(resolved.shell, null, "a rejected selection is never recorded");
+  assert.equal(resolved.fallback, "no in-scope project .envrc", "ordinary launches still fall back");
+});
+
+test("an inherited ancestor .envrc cannot acknowledge a nested flake selection", integration, async (t) => {
+  const { projects: [cwd], environments } = await fixture(t);
+  const system = process.arch === "arm64" ? "aarch64-linux" : "x86_64-linux";
+  const nested = path.join(cwd, "nested");
+  await mkdir(nested);
+  // Same shell names as the parent on purpose: the ancestor .envrc would
+  // acknowledge "default" while loading the parent flake, not the nested one.
+  await writeFile(path.join(nested, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "nested-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; docs = shell; }; }; }`);
+  await assert.rejects(
+    environments.select({ sessionID: "a", cwd: nested, shell: "default" }),
+    /selected flake root/,
+    "explicit selection must not inherit the ancestor .envrc",
+  );
+  const resolved = await environments.resolve({ sessionID: "a", cwd: nested });
+  assert.equal(resolved.shell, null, "a rejected selection is never recorded");
+  assert.equal(resolved.fallback, null, "ordinary nested launches still inherit the ancestor");
+  assert.equal(resolved.env.PROJECT_TEST, "a:default");
+});
+
+test("removing a selected project's local .envrc rejects instead of inheriting the ancestor", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t);
+  const nested = path.join(cwd, "nested");
+  await mkdir(nested);
+  const system = process.arch === "arm64" ? "aarch64-linux" : "x86_64-linux";
+  await writeFile(path.join(nested, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "nested-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; docs = shell; }; }; }`);
+  await writeFile(path.join(nested, ".envrc"), 'export PROJECT_TEST="nested:${PROJECT_DEV_SHELL:-default}"\nexport PROJECT_DEV_SHELL_ACTIVE="${PROJECT_DEV_SHELL:-default}"\nunset PROJECT_TEST_BASE\n');
+  await exec(direnv, ["allow", nested], { env: baseline });
+  await environments.select({ sessionID: "a", cwd: nested, shell: "docs" });
+  assert.equal((await environments.resolve({ sessionID: "a", cwd: nested })).env.PROJECT_TEST, "nested:docs");
+  await rm(path.join(nested, ".envrc"));
+  await assert.rejects(
+    environments.resolve({ sessionID: "a", cwd: nested }),
+    /selected flake root/,
+    "a removed local .envrc must not silently redirect selection to the ancestor",
+  );
+  await assert.rejects(environments.select({ sessionID: "a", cwd: nested, shell: "docs" }), /selected flake root/);
+});
+
+test("export failure never approves an ancestor on selection's behalf", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t, { direnvApproval: "auto" });
+  const system = process.arch === "arm64" ? "aarch64-linux" : "x86_64-linux";
+  const nested = path.join(cwd, "nested");
+  await mkdir(nested);
+  await writeFile(path.join(nested, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "nested-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; docs = shell; }; }; }`);
+  // The local definition deletes itself during export, so recovery discovers
+  // the ancestor. The ancestor is unapproved: recovery without the selection
+  // restriction would auto-allow it before rethrowing the export failure.
+  await writeFile(path.join(nested, ".envrc"), `rm -f ${JSON.stringify(path.join(nested, ".envrc"))}\nexit 1\n`);
+  await exec(direnv, ["allow", nested], { env: baseline });
+  await writeFile(path.join(cwd, ".envrc"), 'export PROJECT_TEST="edited-ancestor"\n');
+  const ancestorAllowed = async () => JSON.parse((await exec(direnv, ["status", "--json"], { cwd, env: baseline })).stdout).state.foundRC.allowed;
+  assert.equal(await ancestorAllowed(), 1);
+  await assert.rejects(
+    environments.select({ sessionID: "a", cwd: nested, shell: "docs" }),
+    /selected flake root/,
+    "recovery keeps the selection restriction instead of approving the ancestor",
+  );
+  assert.equal(await ancestorAllowed(), 1, "the ancestor keeps its original trust state");
+});
+
+test("a denied ancestor .envrc still blocks an ordinary nested launch", integration, async (t) => {
+  const { projects: [cwd], baseline, environments } = await fixture(t);
+  const nested = path.join(cwd, "nested");
+  await mkdir(nested);
+  const system = process.arch === "arm64" ? "aarch64-linux" : "x86_64-linux";
+  await writeFile(path.join(nested, "flake.nix"), `{ outputs = {self}: { devShells.${system} = let shell = builtins.derivation { name = "nested-shell"; system = "${system}"; builder = "/bin/sh"; }; in { default = shell; }; }; }`);
+  await exec(direnv, ["deny", cwd], { env: baseline });
+  await assert.rejects(environments.resolve({ sessionID: "a", cwd: nested }), /operator approval/);
+});
+
+test("project, fallback and project launches stay isolated in sequence", integration, async (t) => {
+  const { projects: [a, b], environments } = await fixture(t);
+  const outside = path.join(path.dirname(a), "outside");
+  await mkdir(outside);
+  assert.equal((await environments.resolve({ sessionID: "s", cwd: a })).env.PROJECT_TEST, "a:default");
+  const middle = await environments.resolve({ sessionID: "s", cwd: outside });
+  assert.equal(middle.fallback, "outside configured project roots");
+  assert.equal(middle.env.PROJECT_TEST, undefined);
+  assert.equal(middle.env.PROJECT_TEST_BASE, "baseline");
+  assert.equal((await environments.resolve({ sessionID: "s", cwd: b })).env.PROJECT_TEST, "b:default");
+  assert.equal((await environments.resolve({ sessionID: "s", cwd: a })).env.PROJECT_TEST, "a:default");
 });
 
 test("failed selected preparation preserves the previous choice", integration, async (t) => {
